@@ -47,7 +47,7 @@ wget -qO- https://raw.githubusercontent.com/dewil/mihomo-cascade/main/install.sh
 ## Что делает install.sh
 
 1. Проверяет запуск от root
-2. Скачивает бинарник mihomo v1.19.21 с GitHub
+2. Скачивает бинарник mihomo с GitHub (версия задана переменной `MIHOMO_VERSION` в начале `install.sh`; если уже установлена та же версия — шаг пропускается)
 3. Создаёт системного пользователя `mihomo` (с корректным `nologin`)
 4. Берёт файлы либо локально, либо скачивает их из GitHub repo
 5. Копирует конфигурацию в `/etc/mihomo/`
