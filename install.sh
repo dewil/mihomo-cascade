@@ -92,9 +92,9 @@ prepare_source_dir() {
   fetch_from_github "etc/cron.d/mihomo-refresh" "${TMP_FETCH}/etc/cron.d/mihomo-refresh"
   fetch_from_github "usr/local/sbin/mihomo-build-config" "${TMP_FETCH}/usr/local/sbin/mihomo-build-config"
   fetch_from_github "usr/local/sbin/mihomo-refresh" "${TMP_FETCH}/usr/local/sbin/mihomo-refresh"
-  fetch_from_github "usr/local/sbin/check-route.sh" "${TMP_FETCH}/usr/local/sbin/check-route.sh"
+  fetch_from_github "usr/local/sbin/check-route" "${TMP_FETCH}/usr/local/sbin/check-route"
 
-  chmod 755 "${TMP_FETCH}/usr/local/sbin/mihomo-build-config" "${TMP_FETCH}/usr/local/sbin/mihomo-refresh" "${TMP_FETCH}/usr/local/sbin/check-route.sh"
+  chmod 755 "${TMP_FETCH}/usr/local/sbin/mihomo-build-config" "${TMP_FETCH}/usr/local/sbin/mihomo-refresh" "${TMP_FETCH}/usr/local/sbin/check-route"
   local source_suffix="/"
   if [ -n "${INSTALL_SUBDIR}" ] && [ "${INSTALL_SUBDIR}" != "." ]; then
     source_suffix="/${INSTALL_SUBDIR}/"
@@ -161,7 +161,7 @@ fi
 echo "=== 5. Устанавливаем скрипты ==="
 install -m 755 "${SOURCE_DIR}/usr/local/sbin/mihomo-build-config" /usr/local/sbin/mihomo-build-config
 install -m 755 "${SOURCE_DIR}/usr/local/sbin/mihomo-refresh"      /usr/local/sbin/mihomo-refresh
-install -m 755 "${SOURCE_DIR}/usr/local/sbin/check-route.sh"       /usr/local/sbin/check-route
+install -m 755 "${SOURCE_DIR}/usr/local/sbin/check-route"       /usr/local/sbin/check-route
 echo "  -> скрипты установлены в /usr/local/sbin/"
 
 if [ "$MODE" = "fresh" ]; then
