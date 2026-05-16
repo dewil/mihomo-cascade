@@ -108,7 +108,7 @@ SOURCE_DIR="$(prepare_source_dir)"
 echo "=== 1. Скачиваем mihomo ${MIHOMO_VERSION} (${ARCH_DL}) ==="
 INSTALLED_VERSION=""
 if [ -x /usr/local/bin/mihomo ]; then
-  INSTALLED_VERSION="$(/usr/local/bin/mihomo -v 2>/dev/null | head -1 | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+  INSTALLED_VERSION="$(/usr/local/bin/mihomo -v 2>/dev/null | head -1 | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
 fi
 if [ "$INSTALLED_VERSION" = "$MIHOMO_VERSION" ]; then
   echo "  -> /usr/local/bin/mihomo уже ${MIHOMO_VERSION}, пропускаем"
