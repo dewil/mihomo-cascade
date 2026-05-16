@@ -1,11 +1,27 @@
 #!/bin/bash
-# Пересобирает config.yaml (подписка + rules) и подгружает его в работающий Mihomo без рестарта (PUT /configs).
+# Пересобирает config.yaml (подписка + rules) и подгружает его в работающий
+# Mihomo без рестарта (PUT /configs). Если итоговый config.yaml совпадает с
+# предыдущим побайтово — PUT не делаем, чтобы не дёргать mihomo зря.
 set -euo pipefail
+
+CFG="/etc/mihomo/config.yaml"
+
+hash_of() {
+  [[ -f "$1" ]] || { echo ""; return; }
+  md5sum "$1" | awk '{print $1}'
+}
+
+OLD_HASH="$(hash_of "$CFG")"
 
 /usr/local/sbin/mihomo-build-config
 
+NEW_HASH="$(hash_of "$CFG")"
+
+if [[ -n "$OLD_HASH" && "$OLD_HASH" == "$NEW_HASH" ]]; then
+  exit 0
+fi
+
 API="${MIHOMO_API:-http://127.0.0.1:9090}"
-CFG="/etc/mihomo/config.yaml"
 
 AUTH=()
 if [[ -f "$CFG" ]]; then

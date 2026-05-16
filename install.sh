@@ -2,7 +2,7 @@
 set -euo pipefail
 
 MIHOMO_VERSION="v1.19.21"
-GITHUB_REPO="${GITHUB_REPO:-dewil/mihomo-install}"
+GITHUB_REPO="${GITHUB_REPO:-dewil/mihomo-cascade}"
 GITHUB_REF="${GITHUB_REF:-main}"
 INSTALL_SUBDIR="${INSTALL_SUBDIR:-}"
 ARCH=$(uname -m)
@@ -19,6 +19,23 @@ if [ "$(id -u)" -ne 0 ]; then
   echo "Run as root (sudo)."
   exit 1
 fi
+
+# Режим установки: fresh (с нуля) или update (на уже развёрнутый mihomo-cascade).
+# Детект автоматический: если /etc/mihomo/subscription.url уже непустой — это update.
+# Можно форсировать через MIHOMO_INSTALL_MODE=fresh|update.
+MODE="${MIHOMO_INSTALL_MODE:-}"
+if [ -z "$MODE" ]; then
+  if [ -s /etc/mihomo/subscription.url ]; then
+    MODE="update"
+  else
+    MODE="fresh"
+  fi
+fi
+case "$MODE" in
+  fresh|update) ;;
+  *) echo "Unknown MIHOMO_INSTALL_MODE: $MODE (expected fresh|update)"; exit 1 ;;
+esac
+echo "=== Режим установки: ${MODE} ==="
 
 NOLOGIN_BIN="$(command -v nologin || true)"
 if [ -z "$NOLOGIN_BIN" ]; then
@@ -75,8 +92,9 @@ prepare_source_dir() {
   fetch_from_github "etc/cron.d/mihomo-refresh" "${TMP_FETCH}/etc/cron.d/mihomo-refresh"
   fetch_from_github "usr/local/sbin/mihomo-build-config" "${TMP_FETCH}/usr/local/sbin/mihomo-build-config"
   fetch_from_github "usr/local/sbin/mihomo-refresh" "${TMP_FETCH}/usr/local/sbin/mihomo-refresh"
+  fetch_from_github "usr/local/sbin/check-route.sh" "${TMP_FETCH}/check-route.sh"
 
-  chmod 755 "${TMP_FETCH}/usr/local/sbin/mihomo-build-config" "${TMP_FETCH}/usr/local/sbin/mihomo-refresh"
+  chmod 755 "${TMP_FETCH}/usr/local/sbin/mihomo-build-config" "${TMP_FETCH}/usr/local/sbin/mihomo-refresh" "${TMP_FETCH}/usr/local/sbin/check-route.sh"
   local source_suffix="/"
   if [ -n "${INSTALL_SUBDIR}" ] && [ "${INSTALL_SUBDIR}" != "." ]; then
     source_suffix="/${INSTALL_SUBDIR}/"
@@ -108,10 +126,20 @@ echo "=== 3. Копируем конфигурацию ==="
 install -d -o root -g mihomo -m 750 /etc/mihomo
 install -d -o root -g mihomo -m 750 /etc/mihomo/providers
 
-for f in config.base.yaml subscription.url routing-rules.url routing-rules.yaml iso3166_alpha2.txt; do
+# Файлы из репо (источник правды) — затираем всегда:
+for f in config.base.yaml iso3166_alpha2.txt; do
   install -o root -g mihomo -m 640 "${SOURCE_DIR}/etc/mihomo/${f}" "/etc/mihomo/${f}"
 done
-echo "  -> конфиги скопированы в /etc/mihomo/"
+
+# Пользовательские файлы — кладём только в fresh-режиме, иначе оставляем как есть:
+if [ "$MODE" = "fresh" ]; then
+  for f in subscription.url routing-rules.url routing-rules.yaml; do
+    install -o root -g mihomo -m 640 "${SOURCE_DIR}/etc/mihomo/${f}" "/etc/mihomo/${f}"
+  done
+  echo "  -> конфиги скопированы в /etc/mihomo/"
+else
+  echo "  -> repo-managed файлы обновлены, пользовательские (subscription.url, routing-rules.*) сохранены"
+fi
 
 echo "=== 4. Скачиваем GeoIP базу ==="
 if [ ! -f /etc/mihomo/geoip.metadb ]; then
@@ -125,25 +153,30 @@ fi
 echo "=== 5. Устанавливаем скрипты ==="
 install -m 755 "${SOURCE_DIR}/usr/local/sbin/mihomo-build-config" /usr/local/sbin/mihomo-build-config
 install -m 755 "${SOURCE_DIR}/usr/local/sbin/mihomo-refresh"      /usr/local/sbin/mihomo-refresh
+install -m 755 "${SOURCE_DIR}/check-route.sh"                      /usr/local/sbin/check-route
 echo "  -> скрипты установлены в /usr/local/sbin/"
 
-echo "=== 6. Запрашиваем ссылки у пользователя ==="
-read -r -p "Введите ссылку на подписку (subscription.url): " SUBSCRIPTION_URL
-if [ -z "${SUBSCRIPTION_URL}" ]; then
-  echo "Пустая ссылка на подписку. Установка прервана."
-  exit 1
-fi
-printf '%s\n' "${SUBSCRIPTION_URL}" > /etc/mihomo/subscription.url
+if [ "$MODE" = "fresh" ]; then
+  echo "=== 6. Запрашиваем ссылки у пользователя ==="
+  read -r -p "Введите ссылку на подписку (subscription.url): " SUBSCRIPTION_URL
+  if [ -z "${SUBSCRIPTION_URL}" ]; then
+    echo "Пустая ссылка на подписку. Установка прервана."
+    exit 1
+  fi
+  printf '%s\n' "${SUBSCRIPTION_URL}" > /etc/mihomo/subscription.url
 
-read -r -p "Введите ссылку на обновление маршрутов (routing-rules.url): " ROUTING_RULES_URL
-if [ -z "${ROUTING_RULES_URL}" ]; then
-  echo "Пустая ссылка на маршруты. Установка прервана."
-  exit 1
+  read -r -p "Введите ссылку на обновление маршрутов (routing-rules.url): " ROUTING_RULES_URL
+  if [ -z "${ROUTING_RULES_URL}" ]; then
+    echo "Пустая ссылка на маршруты. Установка прервана."
+    exit 1
+  fi
+  printf '%s\n' "${ROUTING_RULES_URL}" > /etc/mihomo/routing-rules.url
+  chown root:mihomo /etc/mihomo/subscription.url /etc/mihomo/routing-rules.url
+  chmod 640 /etc/mihomo/subscription.url /etc/mihomo/routing-rules.url
+  echo "  -> ссылки сохранены в /etc/mihomo/"
+else
+  echo "=== 6. Пропускаем запрос ссылок (режим update) ==="
 fi
-printf '%s\n' "${ROUTING_RULES_URL}" > /etc/mihomo/routing-rules.url
-chown root:mihomo /etc/mihomo/subscription.url /etc/mihomo/routing-rules.url
-chmod 640 /etc/mihomo/subscription.url /etc/mihomo/routing-rules.url
-echo "  -> ссылки сохранены в /etc/mihomo/"
 
 echo "=== 7. Устанавливаем systemd-сервис ==="
 install -m 644 "${SOURCE_DIR}/etc/systemd/system/mihomo.service" /etc/systemd/system/mihomo.service
@@ -163,8 +196,13 @@ echo "  -> cron установлен (обновление подписки ка
 
 echo "=== 9. Запускаем ==="
 systemctl enable mihomo
-systemctl start mihomo
-echo "  -> mihomo запущен и включён в автозагрузку"
+if [ "$MODE" = "fresh" ]; then
+  systemctl start mihomo
+  echo "  -> mihomo запущен и включён в автозагрузку"
+else
+  systemctl restart mihomo
+  echo "  -> mihomo перезапущен с новыми скриптами/конфигом"
+fi
 
 echo ""
 echo "Готово! Проверка: systemctl status mihomo"
