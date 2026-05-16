@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-MIHOMO_VERSION="v1.19.21"
+MIHOMO_VERSION="v1.19.25"
 GITHUB_REPO="${GITHUB_REPO:-dewil/mihomo-cascade}"
 GITHUB_REF="${GITHUB_REF:-main}"
 INSTALL_SUBDIR="${INSTALL_SUBDIR:-}"
@@ -106,13 +106,21 @@ prepare_source_dir() {
 SOURCE_DIR="$(prepare_source_dir)"
 
 echo "=== 1. Скачиваем mihomo ${MIHOMO_VERSION} (${ARCH_DL}) ==="
-TMP=$(mktemp -d)
-curl -fsSL "https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_VERSION}/mihomo-linux-${ARCH_DL}-${MIHOMO_VERSION}.gz" \
-  -o "${TMP}/mihomo.gz"
-gunzip "${TMP}/mihomo.gz"
-install -m 755 "${TMP}/mihomo" /usr/local/bin/mihomo
-rm -rf "$TMP"
-echo "  -> /usr/local/bin/mihomo установлен"
+INSTALLED_VERSION=""
+if [ -x /usr/local/bin/mihomo ]; then
+  INSTALLED_VERSION="$(/usr/local/bin/mihomo -v 2>/dev/null | head -1 | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+fi
+if [ "$INSTALLED_VERSION" = "$MIHOMO_VERSION" ]; then
+  echo "  -> /usr/local/bin/mihomo уже ${MIHOMO_VERSION}, пропускаем"
+else
+  TMP=$(mktemp -d)
+  curl -fsSL "https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_VERSION}/mihomo-linux-${ARCH_DL}-${MIHOMO_VERSION}.gz" \
+    -o "${TMP}/mihomo.gz"
+  gunzip "${TMP}/mihomo.gz"
+  install -m 755 "${TMP}/mihomo" /usr/local/bin/mihomo
+  rm -rf "$TMP"
+  echo "  -> /usr/local/bin/mihomo установлен (${INSTALLED_VERSION:-нет} -> ${MIHOMO_VERSION})"
+fi
 
 echo "=== 2. Создаём пользователя mihomo ==="
 if ! id mihomo &>/dev/null; then
