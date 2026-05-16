@@ -44,6 +44,20 @@ wget -qO- https://raw.githubusercontent.com/dewil/mihomo-cascade/main/install.sh
 
 Режим можно форсировать переменной `MIHOMO_INSTALL_MODE=fresh|update`.
 
+### Если `raw.githubusercontent.com` недоступен (РФ)
+
+В РФ `raw.githubusercontent.com` периодически режется по SSL handshake — `wget | bash` может молча падать с `OpenSSL SSL_ERROR_SYSCALL` ещё до скачивания скриптов. GitHub Releases (`release-assets.githubusercontent.com`, бинарник mihomo) при этом обычно работает, потому что лежит на Azure-blob CDN.
+
+Обходной путь — rsync исходников с локалки и запуск локального `install.sh` (он сам fallback'ит на локальные файлы, см. `prepare_source_dir`):
+
+```bash
+rsync -az --delete \
+  --exclude='.git' --exclude='__pycache__' --exclude='*.code-workspace' \
+  /path/to/mihomo-cascade/ <host>:/tmp/mihomo-cascade/
+
+ssh <host> 'bash /tmp/mihomo-cascade/install.sh && rm -rf /tmp/mihomo-cascade'
+```
+
 ## Что делает install.sh
 
 1. Проверяет запуск от root
