@@ -357,6 +357,15 @@ def _adjust_base_for_no_ipv6(base_text: str) -> tuple[str, bool]:
     """
     Если IPv6 выключен в ядре, оставляем TUN, но выключаем авто-маршрутизацию.
     Иначе Mihomo циклически падает на add rule ... address family not supported.
+
+    ВНИМАНИЕ: это не безвредный fallback. С выключенной auto-route TUN
+    бесполезен для системного трафика самой ноды (только клиенты mihomo
+    через socks5://127.0.0.1:7891 заворачиваются). На провайдерах, которые
+    фильтруют исходящий трафик по РКН-спискам (cloud.ru/Сбер AS208677,
+    подобные облака), это означает что system-wide direct-curl не может
+    дотянуться до Facebook/Instagram/Telegram CDN, мониторинг ноды красный.
+    Лечится включением IPv6 в ядре (убрать ipv6.disable=1 из GRUB) - см.
+    инцидент 2026-05-17 на ru2 в репо cactus-adm/docs.
     """
     if not _host_ipv6_unavailable():
         return base_text, False
@@ -398,7 +407,12 @@ def main() -> int:
     base_adj, changed = _adjust_base_for_no_ipv6(base_raw)
     if changed:
         print(
-            "IPv6 stack unavailable: generated config will use tun.auto-route=false and tun.auto-redirect=false",
+            "WARNING: IPv6 stack unavailable in kernel. "
+            "Generated config uses tun.auto-route=false / auto-redirect=false. "
+            "System-wide transparent proxy via TUN is DISABLED. "
+            "On providers that filter outbound by RKN lists (cloud.ru/Сбер, etc.) "
+            "the node's own outbound (curl, monitoring) will hit the block. "
+            "Fix: remove ipv6.disable=1 from /etc/default/grub, run update-grub, reboot.",
             file=sys.stderr,
         )
     base = base_adj.rstrip() + "\n\n"
