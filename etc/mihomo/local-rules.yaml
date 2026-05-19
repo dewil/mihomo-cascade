@@ -1,0 +1,9 @@
+# Локальные правила mihomo-cascade. Применяются ПЕРЕД скачанными по
+# routing-rules.url (subscribe_domain/.../rules.yaml), то есть имеют приоритет.
+#
+# Сюда складываем REJECT/форс-DIRECT, нужные на каждой ноде независимо от
+# того, что отдаёт центральный rules-агрегатор.
+rules:
+  # XMPP/GTalk port 5222: Google отключил endpoint, клиенты бесконечно ретраят
+  # и засоряют warning-лог. Отвечаем REJECT, чтобы не висел timeout.
+  - "DST-PORT,5222,REJECT"

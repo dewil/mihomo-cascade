@@ -88,6 +88,7 @@ prepare_source_dir() {
   fetch_from_github "etc/mihomo/routing-rules.url" "${TMP_FETCH}/etc/mihomo/routing-rules.url"
   fetch_from_github "etc/mihomo/routing-rules.yaml" "${TMP_FETCH}/etc/mihomo/routing-rules.yaml"
   fetch_from_github "etc/mihomo/iso3166_alpha2.txt" "${TMP_FETCH}/etc/mihomo/iso3166_alpha2.txt"
+  fetch_from_github "etc/mihomo/local-rules.yaml" "${TMP_FETCH}/etc/mihomo/local-rules.yaml"
   fetch_from_github "etc/systemd/system/mihomo.service" "${TMP_FETCH}/etc/systemd/system/mihomo.service"
   fetch_from_github "etc/cron.d/mihomo-refresh" "${TMP_FETCH}/etc/cron.d/mihomo-refresh"
   fetch_from_github "usr/local/sbin/mihomo-build-config" "${TMP_FETCH}/usr/local/sbin/mihomo-build-config"
@@ -135,7 +136,7 @@ install -d -o root -g mihomo -m 750 /etc/mihomo
 install -d -o root -g mihomo -m 750 /etc/mihomo/providers
 
 # Файлы из репо (источник правды) — затираем всегда:
-for f in config.base.yaml iso3166_alpha2.txt; do
+for f in config.base.yaml iso3166_alpha2.txt local-rules.yaml; do
   install -o root -g mihomo -m 640 "${SOURCE_DIR}/etc/mihomo/${f}" "/etc/mihomo/${f}"
 done
 

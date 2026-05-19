@@ -11,8 +11,8 @@ import pathlib
 import re
 import subprocess
 import sys
-from typing import Dict, List, Set, Tuple
-from urllib.parse import unquote, urlparse
+from typing import Any, Dict, List, Optional, Set, Tuple
+from urllib.parse import parse_qs, unquote, urlparse
 
 BASE = pathlib.Path("/etc/mihomo")
 SUB_URL = BASE / "subscription.url"
@@ -20,6 +20,7 @@ PROVIDER_FILE = BASE / "providers" / "vless_sub.yaml"
 BASE_CFG = BASE / "config.base.yaml"
 ROUTING_RULES = BASE / "routing-rules.yaml"
 ROUTING_RULES_URL = BASE / "routing-rules.url"
+LOCAL_RULES = BASE / "local-rules.yaml"
 ISO_CODES = BASE / "iso3166_alpha2.txt"
 ALIASES_OUT = BASE / "aliases.yaml"
 OUT_CFG = BASE / "config.yaml"
@@ -131,46 +132,182 @@ def _download_routing_rules(url: str) -> bool:
     return True
 
 
-def _name_from_vless(uri: str) -> str:
+def _parse_vless_uri(uri: str) -> Optional[Dict[str, Any]]:
+    """vless:// URI -> Clash proxy dict (mihomo-совместимый).
+
+    Покрытие query-полей: sni, type, alpn, host, path, serviceName, mode, fp,
+    allowInsecure, insecure, security, encryption, headerType, hiddify, flow,
+    pbk, sid. Нерелевантные игнорируются: encryption всегда none в vless,
+    hiddify - флаг клиента, headerType=none для tcp, mode=gun - default.
+    """
     p = urlparse(uri.strip())
-    frag = unquote(p.fragment) if p.fragment else ""
-    return frag.strip() or uri[:80]
+    if p.scheme != "vless" or not p.username or not p.hostname:
+        return None
+
+    q = parse_qs(p.query, keep_blank_values=True)
+
+    def qv(*keys: str) -> Optional[str]:
+        for k in keys:
+            if k in q and q[k]:
+                return q[k][0]
+        return None
+
+    name = unquote(p.fragment).strip() if p.fragment else f"{p.hostname}:{p.port or 443}"
+
+    out: Dict[str, Any] = {
+        "name": name,
+        "type": "vless",
+        "server": p.hostname,
+        "port": p.port or 443,
+        "uuid": p.username,
+        "udp": True,
+    }
+
+    network = qv("type") or "tcp"
+    out["network"] = network
+
+    security = (qv("security") or "none").lower()
+    if security in ("tls", "reality"):
+        out["tls"] = True
+        if security == "reality":
+            reality: Dict[str, Any] = {}
+            if (v := qv("pbk")):
+                reality["public-key"] = v
+            if (v := qv("sid")):
+                reality["short-id"] = v
+            if reality:
+                out["reality-opts"] = reality
+
+    if (v := qv("sni")):
+        out["servername"] = v
+
+    if (v := qv("alpn")):
+        alpn = [a.strip() for a in v.replace(" ", "").split(",") if a.strip()]
+        if alpn:
+            out["alpn"] = alpn
+
+    if (v := qv("fp")):
+        out["client-fingerprint"] = v
+
+    if (qv("allowInsecure", "insecure") or "").lower() in ("1", "true"):
+        out["skip-cert-verify"] = True
+
+    if (v := qv("flow")):
+        out["flow"] = v
+
+    if network == "grpc":
+        sn = qv("serviceName") or qv("path")
+        if sn:
+            out["grpc-opts"] = {"grpc-service-name": sn}
+    elif network == "ws":
+        ws: Dict[str, Any] = {}
+        if (v := qv("path")):
+            ws["path"] = v
+        host_header = qv("host") or out.get("servername") or out["server"]
+        if host_header:
+            ws["headers"] = {"Host": host_header}
+        if ws:
+            out["ws-opts"] = ws
+
+    return out
 
 
-def _extract_proxy_names(raw: bytes) -> List[str]:
+def _decode_subscription_proxies(raw: bytes) -> List[Dict[str, Any]]:
+    """Сырой ответ подписки -> список Clash proxy dict.
+
+    Принимает оба формата: голые vless:// строки или base64-encoded блок
+    (v2ray/sing-box subscription format). Не-vless строки (happ://, остальное)
+    игнорируются.
+    """
     text = raw.decode("utf-8", "replace").strip()
-    names: List[str] = []
-    seen: Set[str] = set()
+    candidate = text
+    if "vless:" not in text.lower():
+        try:
+            stripped = re.sub(r"\s+", "", text)
+            pad = (-len(stripped)) % 4
+            decoded = base64.b64decode(stripped + "=" * pad, validate=False).decode(
+                "utf-8", "replace"
+            )
+            if "vless:" in decoded.lower():
+                candidate = decoded
+        except Exception:
+            pass
 
-    for line in text.splitlines():
+    proxies: List[Dict[str, Any]] = []
+    seen_names: Set[str] = set()
+    for line in candidate.splitlines():
         line = line.strip()
-        if not line:
-            continue
-        chunk = line
         if not line.startswith("vless:"):
-            try:
-                pad = len(line) % 4
-                if pad:
-                    line += "=" * (4 - pad)
-                dec = base64.b64decode(line, validate=False).decode("utf-8", "replace")
-                chunk = dec
-            except Exception:
-                chunk = line
+            continue
+        proxy = _parse_vless_uri(line)
+        if not proxy:
+            continue
+        if proxy["name"] in seen_names:
+            continue
+        seen_names.add(proxy["name"])
+        proxies.append(proxy)
+    return proxies
 
-        for part in chunk.splitlines():
-            part = part.strip()
-            if not part.startswith("vless:"):
-                continue
-            n = _name_from_vless(part)
-            if n and n not in seen:
-                seen.add(n)
-                names.append(n)
-        if line.startswith("vless:"):
-            n = _name_from_vless(line)
-            if n and n not in seen:
-                seen.add(n)
-                names.append(n)
-    return names
+
+_PROXY_FIELD_ORDER = (
+    "name",
+    "type",
+    "server",
+    "port",
+    "uuid",
+    "network",
+    "tls",
+    "servername",
+    "alpn",
+    "client-fingerprint",
+    "skip-cert-verify",
+    "udp",
+    "flow",
+    "grpc-opts",
+    "ws-opts",
+    "reality-opts",
+)
+
+
+def _dump_clash_proxies(proxies: List[Dict[str, Any]]) -> str:
+    """Список прокси -> Clash YAML (proxies: [...]), без PyYAML.
+
+    На каждый scalar используется json.dumps - валидно и для JSON, и для YAML.
+    bool/list/dict сериализуются явно. mihomo читает type:file как полноценный
+    Clash-конфиг (тот же парсер, что у Clash-Meta).
+    """
+    def emit_scalar(v: Any) -> str:
+        if isinstance(v, bool):
+            return "true" if v else "false"
+        if isinstance(v, (int, float)):
+            return json.dumps(v)
+        return json.dumps(v, ensure_ascii=False)
+
+    lines: List[str] = ["proxies:"]
+    for proxy in proxies:
+        keys = [k for k in _PROXY_FIELD_ORDER if k in proxy]
+        keys += [k for k in proxy.keys() if k not in _PROXY_FIELD_ORDER]
+        first = True
+        for k in keys:
+            v = proxy[k]
+            prefix = "  - " if first else "    "
+            first = False
+            if isinstance(v, dict):
+                lines.append(f"{prefix}{k}:")
+                for kk, vv in v.items():
+                    if isinstance(vv, dict):
+                        lines.append(f"      {kk}:")
+                        for kkk, vvv in vv.items():
+                            lines.append(f"        {kkk}: {emit_scalar(vvv)}")
+                    else:
+                        lines.append(f"      {kk}: {emit_scalar(vv)}")
+            elif isinstance(v, list):
+                lines.append(f"{prefix}{k}:")
+                for item in v:
+                    lines.append(f"      - {emit_scalar(item)}")
+            else:
+                lines.append(f"{prefix}{k}: {emit_scalar(v)}")
+    return "\n".join(lines) + "\n"
 
 
 def _load_iso_codes() -> List[str]:
@@ -225,13 +362,12 @@ def _assign_aliases(
     return assigned
 
 
-def _load_routing_rules() -> List[str]:
-    if not ROUTING_RULES.is_file():
-        return ["MATCH,DIRECT"]
-    text = ROUTING_RULES.read_text(encoding="utf-8")
+def _parse_rules_file(path: pathlib.Path) -> List[str]:
+    if not path.is_file():
+        return []
     rules: List[str] = []
     in_rules = False
-    for line in text.splitlines():
+    for line in path.read_text(encoding="utf-8").splitlines():
         s = line.strip()
         if s.startswith("rules:"):
             in_rules = True
@@ -243,9 +379,24 @@ def _load_routing_rules() -> List[str]:
             if (r.startswith('"') and r.endswith('"')) or (r.startswith("'") and r.endswith("'")):
                 r = r[1:-1]
             rules.append(r)
+    return rules
+
+
+def _load_routing_rules() -> List[str]:
+    rules = _parse_rules_file(ROUTING_RULES)
     if not rules:
         rules = ["MATCH,DIRECT"]
     return rules
+
+
+def _load_local_rules() -> List[str]:
+    """Локальные правила из mihomo-cascade, идут ПЕРЕД скачанными по
+    routing-rules.url.
+
+    Подходят для блокировок (REJECT по портам/доменам) и форс-DIRECT, которые
+    нужны на каждой ноде независимо от того, что отдаёт центральный агрегатор.
+    """
+    return _parse_rules_file(LOCAL_RULES)
 
 
 def _rule_policy(rule: str) -> str | None:
@@ -395,12 +546,23 @@ def main() -> int:
                 file=sys.stderr,
             )
     raw = PROVIDER_FILE.read_bytes()
-    proxies = _extract_proxy_names(raw)
+    proxies = _decode_subscription_proxies(raw)
+    if not proxies:
+        print(
+            "Из подписки не извлечено ни одного vless-прокси. "
+            "Проверьте формат ответа sub_url (ожидается base64 или plaintext с vless://).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    PROVIDER_FILE.write_text(_dump_clash_proxies(proxies), encoding="utf-8")
+    subprocess.run(["chown", "root:mihomo", str(PROVIDER_FILE)], check=False)
+    subprocess.run(["chmod", "640", str(PROVIDER_FILE)], check=False)
+    proxy_names = [p["name"] for p in proxies]
     codes = _load_iso_codes()
     aliases = _build_alias_regexes(codes)
     _emit_aliases_yaml(aliases)
-    assigned = _assign_aliases(proxies, aliases)
-    rules = _load_routing_rules()
+    assigned = _assign_aliases(proxy_names, aliases)
+    rules = _load_local_rules() + _load_routing_rules()
     gen = _build_generated(assigned, rules, aliases)
 
     base_raw = BASE_CFG.read_text(encoding="utf-8")
