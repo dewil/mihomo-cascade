@@ -486,55 +486,6 @@ def _build_generated(
     return "\n".join(parts) + "\n"
 
 
-def _host_ipv6_unavailable() -> bool:
-    # На части серверов IPv6 отключен на уровне ядра:
-    # ip -6 rule show -> "Address family not supported by protocol".
-    if not pathlib.Path("/proc/net/if_inet6").exists():
-        return True
-    try:
-        p = subprocess.run(
-            ["ip", "-6", "rule", "show"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True,
-            check=False,
-        )
-    except FileNotFoundError:
-        return False
-    return p.returncode != 0
-
-
-def _adjust_base_for_no_ipv6(base_text: str) -> tuple[str, bool]:
-    """
-    Если IPv6 выключен в ядре, оставляем TUN, но выключаем авто-маршрутизацию.
-    Иначе Mihomo циклически падает на add rule ... address family not supported.
-
-    ВНИМАНИЕ: это не безвредный fallback. С выключенной auto-route TUN
-    бесполезен для системного трафика самой ноды (только клиенты mihomo
-    через socks5://127.0.0.1:7891 заворачиваются). На провайдерах, которые
-    фильтруют исходящий трафик по РКН-спискам (cloud.ru/Сбер AS208677,
-    подобные облака), это означает что system-wide direct-curl не может
-    дотянуться до Facebook/Instagram/Telegram CDN, мониторинг ноды красный.
-    Лечится включением IPv6 в ядре (убрать ipv6.disable=1 из GRUB) - см.
-    инцидент 2026-05-17 на ru2 в репо cactus-adm/docs.
-    """
-    if not _host_ipv6_unavailable():
-        return base_text, False
-    out = base_text
-    changed = False
-    for key in ("auto-route", "auto-redirect"):
-        new_out, n = re.subn(
-            rf"(?m)^(\s*{re.escape(key)}:\s*)true(\s*)$",
-            rf"\1false\2",
-            out,
-            count=1,
-        )
-        if n:
-            out = new_out
-            changed = True
-    return out, changed
-
-
 def main() -> int:
     url = _read_subscription_url()
     _download_subscription(url)
@@ -565,19 +516,7 @@ def main() -> int:
     rules = _load_local_rules() + _load_routing_rules()
     gen = _build_generated(assigned, rules, aliases)
 
-    base_raw = BASE_CFG.read_text(encoding="utf-8")
-    base_adj, changed = _adjust_base_for_no_ipv6(base_raw)
-    if changed:
-        print(
-            "WARNING: IPv6 stack unavailable in kernel. "
-            "Generated config uses tun.auto-route=false / auto-redirect=false. "
-            "System-wide transparent proxy via TUN is DISABLED. "
-            "On providers that filter outbound by RKN lists (cloud.ru/Сбер, etc.) "
-            "the node's own outbound (curl, monitoring) will hit the block. "
-            "Fix: remove ipv6.disable=1 from /etc/default/grub, run update-grub, reboot.",
-            file=sys.stderr,
-        )
-    base = base_adj.rstrip() + "\n\n"
+    base = BASE_CFG.read_text(encoding="utf-8").rstrip() + "\n\n"
     OUT_CFG.write_text(base + gen, encoding="utf-8")
     subprocess.run(["chown", "root:mihomo", str(OUT_CFG)], check=False)
     subprocess.run(["chmod", "640", str(OUT_CFG)], check=False)
