@@ -11,6 +11,19 @@ log-level: warning
 external-controller: 127.0.0.1:9090
 secret: ""
 
+# Per-country SOCKS-листенеры для диагностики exit-IP каскада (cactus-adm node:cascade-trace).
+# Листенер с явным proxy: форсит выход через свою страновую группу, МИНУЯ rules и
+# sniffer - поэтому curl --socks5-hostname 127.0.0.1:<port> http://icanhazip.com
+# отдаёт IP exit-ноды именно этой страны (sniffer override-destination не вмешивается).
+# Только localhost. Группы de/de2/ee/it/pl генерит mihomo-build-config из подписки;
+# если группы нет на ноде - mihomo -t упадёт на старте, поэтому раскатывать с проверкой.
+listeners:
+  - { name: trace-de,  type: socks, listen: 127.0.0.1, port: 7901, proxy: de }
+  - { name: trace-de2, type: socks, listen: 127.0.0.1, port: 7902, proxy: de2 }
+  - { name: trace-ee,  type: socks, listen: 127.0.0.1, port: 7903, proxy: ee }
+  - { name: trace-it,  type: socks, listen: 127.0.0.1, port: 7904, proxy: it }
+  - { name: trace-pl,  type: socks, listen: 127.0.0.1, port: 7905, proxy: pl }
+
 # TUN выключен. Системный outbound ноды идёт direct с её реального IP.
 # Hiddify-singbox/xray заворачиваются в mihomo через outbounds.json -> SOCKS 7890,
 # TUN для этого не нужен. Если когда-то понадобится прозрачный прокси на всю
