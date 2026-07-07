@@ -8,6 +8,16 @@ bind-address: "127.0.0.1"
 mode: rule
 log-level: warning
 
+# TCP keepalive на ru->exit туннеле: держит conntrack провайдерского NAT/CGNAT
+# тёплым, чтобы медленный SSE (Claude, long-poll) в паузах генерации не считался
+# idle и не вылетал по RST ("Connection closed mid-response"). CGNAT serv.host
+# (ru3, gw 100.65.65.65) роняет idle-flow за ~30с - пробники каждые 10с перекрывают.
+# Проверено на ru3 2026-07-07: без keepalive длинный стрим рвётся на ~30с (2/2),
+# с keepalive проходит 60/60 (3/3). Применяется reload'ом API, без рестарта.
+keep-alive-idle: 10
+keep-alive-interval: 10
+disable-keep-alive: false
+
 external-controller: 127.0.0.1:9090
 secret: ""
 
