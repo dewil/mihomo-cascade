@@ -33,6 +33,7 @@ listeners:
   - { name: trace-ee,  type: socks, listen: 127.0.0.1, port: 7903, proxy: ee }
   - { name: trace-it,  type: socks, listen: 127.0.0.1, port: 7904, proxy: it }
   - { name: trace-pl,  type: socks, listen: 127.0.0.1, port: 7905, proxy: pl }
+  - { name: trace-de3, type: socks, listen: 127.0.0.1, port: 7906, proxy: de3 }
 
 # TUN выключен. Системный outbound ноды идёт direct с её реального IP.
 # Hiddify-singbox/xray заворачиваются в mihomo через outbounds.json -> SOCKS 7890,
