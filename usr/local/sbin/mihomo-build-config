@@ -58,8 +58,19 @@ def _read_subscription_url() -> str:
     return url
 
 
-def _download_subscription(url: str) -> None:
-    tmp = PROVIDER_FILE.with_suffix(".tmp")
+def _download_subscription(url: str) -> bytes:
+    """Скачивает подписку и отдает ее СЫРЫЕ байты, не трогая PROVIDER_FILE.
+
+    Раньше сырая подписка сначала клалась в сам PROVIDER_FILE, и только потом
+    он перезаписывался YAML-ом. mihomo следит за этим файлом и перечитывает его
+    по изменению - и попадал в промежуточное окно, где вместо списка прокси
+    лежит base64. В журнале это 161 ошибка за сутки вида
+    "file must have a `proxies` field", после которой провайдер остается без
+    узлов и соединения через его группу рвутся.
+    """
+    # Кладем СНАРУЖИ providers/ - в каталоге, за которым следит mihomo, лишним
+    # файлам не место.
+    tmp = BASE / ".subscription.raw.tmp"
     try:
         subprocess.run(
             [
@@ -78,9 +89,35 @@ def _download_subscription(url: str) -> None:
     except subprocess.CalledProcessError as e:
         print(f"Не удалось скачать подписку: {e}", file=sys.stderr)
         sys.exit(1)
-    tmp.replace(PROVIDER_FILE)
-    subprocess.run(["chown", "root:mihomo", str(PROVIDER_FILE)], check=False)
-    subprocess.run(["chmod", "640", str(PROVIDER_FILE)], check=False)
+    try:
+        return tmp.read_bytes()
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _write_if_changed(path: pathlib.Path, text: str, *, owner: str = "root:mihomo") -> bool:
+    """Пишет файл атомарно и только при изменении содержимого.
+
+    Два разных дефекта закрываются здесь сразу:
+
+    - `write_text` сначала обрезает файл, потом пишет; читатель (mihomo следит
+      за файлом провайдера) успевал прочитать половину списка - это 306 ошибок
+      за сутки "doesn't match any proxy". Пишем во временный файл рядом и
+      подменяем через os.replace - атомарно, читатель видит либо старое, либо
+      новое целиком;
+    - запись без изменений заставляла mihomo перечитывать провайдера ~1440 раз
+      в сутки на ровном месте. Совпало содержимое - не трогаем файл вовсе,
+      mtime остается прежним.
+    """
+    if path.is_file() and path.read_text(encoding="utf-8") == text:
+        return False
+
+    tmp = path.with_name(path.name + ".new")
+    tmp.write_text(text, encoding="utf-8")
+    subprocess.run(["chown", owner, str(tmp)], check=False)
+    subprocess.run(["chmod", "640", str(tmp)], check=False)
+    tmp.replace(path)
+    return True
 
 
 def _read_routing_rules_url() -> str | None:
@@ -488,7 +525,7 @@ def _build_generated(
 
 def main() -> int:
     url = _read_subscription_url()
-    _download_subscription(url)
+    raw = _download_subscription(url)
     rules_url = _read_routing_rules_url()
     if rules_url:
         if not _download_routing_rules(rules_url):
@@ -496,7 +533,6 @@ def main() -> int:
                 "Используется существующий /etc/mihomo/routing-rules.yaml (если есть).",
                 file=sys.stderr,
             )
-    raw = PROVIDER_FILE.read_bytes()
     proxies = _decode_subscription_proxies(raw)
     if not proxies:
         print(
@@ -505,9 +541,12 @@ def main() -> int:
             file=sys.stderr,
         )
         sys.exit(1)
-    PROVIDER_FILE.write_text(_dump_clash_proxies(proxies), encoding="utf-8")
-    subprocess.run(["chown", "root:mihomo", str(PROVIDER_FILE)], check=False)
-    subprocess.run(["chmod", "640", str(PROVIDER_FILE)], check=False)
+    # Агрегатор временами отдает те же узлы в другом порядке. Без сортировки
+    # это давало новый файл провайдера каждую минуту (и лишний pull у mihomo),
+    # а раздача алиасов ниже берет ПЕРВОЕ совпадение - то есть от порядка
+    # зависела бы еще и привязка алиаса к узлу.
+    proxies.sort(key=lambda p: p["name"])
+    _write_if_changed(PROVIDER_FILE, _dump_clash_proxies(proxies))
     proxy_names = [p["name"] for p in proxies]
     codes = _load_iso_codes()
     aliases = _build_alias_regexes(codes)
@@ -517,9 +556,7 @@ def main() -> int:
     gen = _build_generated(assigned, rules, aliases)
 
     base = BASE_CFG.read_text(encoding="utf-8").rstrip() + "\n\n"
-    OUT_CFG.write_text(base + gen, encoding="utf-8")
-    subprocess.run(["chown", "root:mihomo", str(OUT_CFG)], check=False)
-    subprocess.run(["chmod", "640", str(OUT_CFG)], check=False)
+    _write_if_changed(OUT_CFG, base + gen)
     return 0
 
 

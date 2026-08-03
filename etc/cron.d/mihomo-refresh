@@ -2,4 +2,8 @@
 SHELL=/bin/sh
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
 
-* * * * * root /usr/local/sbin/mihomo-refresh
+# flock -n: прогон идет каждую минуту, а curl подписки ждет до 120 с - без
+# лока прогоны накладываются. На s79 такая же связка без лока дала пачку в
+# ~1200 процессов и убила прокси на 7890. timeout - страховка от зависшего
+# прогона, который иначе держал бы лок вечно.
+* * * * * root flock -n /run/mihomo-refresh.lock timeout 300 /usr/local/sbin/mihomo-refresh
