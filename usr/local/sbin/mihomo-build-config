@@ -85,6 +85,13 @@ def _download_subscription(url: str) -> bytes:
             [
                 "curl",
                 "-fsSL",
+                # Подписку тянем ТОЛЬКО напрямую. curl уважает http_proxy/
+                # ALL_PROXY из окружения, а на ноде эти переменные вполне могут
+                # быть выставлены на локальный mihomo - тогда запрос за
+                # подпиской уходит в собственный туннель, где до нашего же
+                # RU-хоста не дойдет (exit-ноды блэкхолят geoip:ru).
+                "--noproxy",
+                "*",
                 "--connect-timeout",
                 "20",
                 "--max-time",
@@ -199,6 +206,10 @@ def _download_routing_rules(url: str) -> bool:
             [
                 "curl",
                 "-fsSL",
+                # Тот же запрет прокси, что и для подписки: правила лежат на том
+                # же хосте.
+                "--noproxy",
+                "*",
                 "--connect-timeout",
                 "15",
                 "--max-time",
