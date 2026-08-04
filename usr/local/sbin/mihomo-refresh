@@ -2,9 +2,25 @@
 # Пересобирает config.yaml (подписка + rules) и подгружает его в работающий
 # Mihomo без рестарта (PUT /configs). Если итоговый config.yaml совпадает с
 # предыдущим побайтово — PUT не делаем, чтобы не дёргать mihomo зря.
+#
+# Перед подгрузкой конфиг проверяется самим mihomo (-t). Невалидный не
+# применяется: файл откатывается на предыдущую копию, в журнал уходит строка с
+# тегом mihomo-refresh. Без этого битый конфиг молча уезжал в работающий
+# процесс.
 set -euo pipefail
 
 CFG="/etc/mihomo/config.yaml"
+CFG_DIR="/etc/mihomo"
+BAK="/etc/mihomo/config.yaml.autobak"
+MIHOMO_BIN="${MIHOMO_BIN:-/usr/local/bin/mihomo}"
+
+fail() {
+  # daemon.err, чтобы провал был виден в journal, а не только в почте крона
+  # (которой на нодах нет). Живой индикатор: journalctl -t mihomo-refresh
+  logger -t mihomo-refresh -p daemon.err -- "$1" || true
+  echo "$1" >&2
+  exit 1
+}
 
 hash_of() {
   [[ -f "$1" ]] || { echo ""; return; }
@@ -13,12 +29,47 @@ hash_of() {
 
 OLD_HASH="$(hash_of "$CFG")"
 
-/usr/local/sbin/mihomo-build-config
+# Копия последнего конфига до сборки - к ней откатываемся, если новый не пройдет
+# проверку. cp -p, чтобы права и владелец (root:mihomo 640) не поехали.
+if [[ -f "$CFG" ]]; then
+  cp -p "$CFG" "$BAK"
+fi
+
+# $? внутри `if ! cmd` уже равен нулю (его перебивает сам `!`), поэтому код
+# возврата снимаем через ||.
+RC=0
+/usr/local/sbin/mihomo-build-config || RC=$?
+
+if [[ $RC -ne 0 ]]; then
+  # Код 3 - сработал пол по составу узлов в build-config: это не поломка, а
+  # осознанный отказ применять усохший список. Конфиг при этом не тронут.
+  if [[ $RC -eq 3 ]]; then
+    logger -t mihomo-refresh -p daemon.warning -- \
+      "сборка отменена: подписка отдала слишком мало узлов (см. вывод mihomo-build-config)" || true
+    exit 0
+  fi
+  fail "mihomo-build-config упал с кодом ${RC}, конфиг не менялся"
+fi
 
 NEW_HASH="$(hash_of "$CFG")"
 
 if [[ -n "$OLD_HASH" && "$OLD_HASH" == "$NEW_HASH" ]]; then
   exit 0
+fi
+
+# Проверяем ровно тем бинарем, который и будет это читать. Быстро (единицы мс) и
+# без побочных эффектов: -t печатает результат и выходит.
+if [[ -x "$MIHOMO_BIN" ]]; then
+  if ! TEST_OUT="$("$MIHOMO_BIN" -t -d "$CFG_DIR" -f "$CFG" 2>&1)"; then
+    if [[ -f "$BAK" ]]; then
+      cp -p "$BAK" "$CFG"
+      fail "новый config.yaml не прошел mihomo -t, откатился на предыдущий: ${TEST_OUT//$'\n'/ | }"
+    fi
+    fail "новый config.yaml не прошел mihomo -t, откатывать не на что: ${TEST_OUT//$'\n'/ | }"
+  fi
+else
+  logger -t mihomo-refresh -p daemon.warning -- \
+    "нет ${MIHOMO_BIN}, конфиг применяется без проверки -t" || true
 fi
 
 API="${MIHOMO_API:-http://127.0.0.1:9090}"
@@ -54,7 +105,24 @@ PY
 fi
 
 BODY=$(CFG="$CFG" python3 -c 'import json, os; print(json.dumps({"path": os.environ["CFG"]}))')
-curl -fsS -X PUT "${API}/configs?force=true" \
+
+# force=true оставлен сознательно. Проверено на ru3 (mihomo 1.19.25, 2026-08-04):
+# reload рвет активные соединения ОДИНАКОВО и с force, и без него - поток через
+# 7890 умирает в обоих случаях, а без reload доживает до конца. То есть снятие
+# force ничего не лечит, а вот применение правок в config.base.yaml (порты,
+# листенеры) без него не сработает. Единственная защита от разрывов - не
+# дергать reload зря; этим занимается сверка хэшей выше.
+if ! curl -fsS -X PUT "${API}/configs?force=true" \
   "${AUTH[@]}" \
   -H "Content-Type: application/json" \
   -d "$BODY"
+then
+  # Откат обязателен, иначе на диске лежит конфиг, который в работе не стоит:
+  # следующий прогон соберет то же самое, увидит совпадение хэшей и НЕ повторит
+  # PUT - правка молча зависнет до следующего изменения подписки.
+  if [[ -f "$BAK" ]]; then
+    cp -p "$BAK" "$CFG"
+    fail "PUT /configs не прошел, config.yaml откачен - следующий прогон повторит попытку"
+  fi
+  fail "PUT /configs не прошел, откатывать не на что"
+fi

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import pathlib
 import re
 import subprocess
@@ -16,6 +17,14 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 BASE = pathlib.Path("/etc/mihomo")
 SUB_URL = BASE / "subscription.url"
+# Пол по составу узлов: подписка, внезапно отдавшая заметно меньше узлов, чем в
+# прошлый раз, скорее всего просто не достучалась до части нод - применять такое
+# нельзя, иначе усохший список за минуту уезжает всем клиентам. Штатное
+# сокращение (ноду вывели из строя специально) проводится через
+# MIHOMO_ALLOW_SHRINK=1.
+MIN_NODES_RATIO = float(os.environ.get("MIHOMO_MIN_NODES_RATIO", "0.7"))
+MIN_NODES_ABS = int(os.environ.get("MIHOMO_MIN_NODES_ABS", "3"))
+ALLOW_SHRINK = os.environ.get("MIHOMO_ALLOW_SHRINK", "") not in ("", "0")
 PROVIDER_FILE = BASE / "providers" / "vless_sub.yaml"
 BASE_CFG = BASE / "config.base.yaml"
 ROUTING_RULES = BASE / "routing-rules.yaml"
@@ -118,6 +127,55 @@ def _write_if_changed(path: pathlib.Path, text: str, *, owner: str = "root:mihom
     subprocess.run(["chmod", "640", str(tmp)], check=False)
     tmp.replace(path)
     return True
+
+
+def _previous_node_count() -> int:
+    """Сколько узлов лежит в текущем файле провайдера. 0 - файла нет."""
+    if not PROVIDER_FILE.is_file():
+        return 0
+    text = PROVIDER_FILE.read_text(encoding="utf-8", errors="replace")
+    return len(re.findall(r"^  - name:", text, flags=re.MULTILINE))
+
+
+def _check_node_floor(new_count: int) -> None:
+    """Не применять резко усохший список узлов.
+
+    Ровно этот случай ловится тяжелее всего: агрегатор не достучался до ноды,
+    молча выкинул ее из выдачи, и через минуту она пропала у всех клиентов.
+    Полное отсутствие узлов ловится отдельно (выход выше), здесь - частичная
+    потеря. Порог по доле от прошлого состава плюс абсолютный минимум.
+    """
+    previous = _previous_node_count()
+    if previous == 0:
+        return
+
+    floor = max(MIN_NODES_ABS, int(previous * MIN_NODES_RATIO))
+    if new_count >= floor:
+        if new_count < previous:
+            # Не блокируем, но след в журнале нужен: это может быть первый
+            # звонок перед настоящей потерей.
+            print(
+                f"Внимание: узлов стало меньше ({previous} -> {new_count}), "
+                f"порог {floor} не нарушен.",
+                file=sys.stderr,
+            )
+        return
+
+    if ALLOW_SHRINK:
+        print(
+            f"MIHOMO_ALLOW_SHRINK: применяю усохший список ({previous} -> {new_count}).",
+            file=sys.stderr,
+        )
+        return
+
+    print(
+        f"Подписка отдала {new_count} узлов против {previous} в прошлый раз "
+        f"(порог {floor}). Файл провайдера и конфиг не тронуты - вероятнее всего "
+        f"часть нод просто не ответила агрегатору. Если сокращение штатное: "
+        f"MIHOMO_ALLOW_SHRINK=1 /usr/local/sbin/mihomo-refresh",
+        file=sys.stderr,
+    )
+    sys.exit(3)
 
 
 def _read_routing_rules_url() -> str | None:
@@ -546,6 +604,7 @@ def main() -> int:
     # а раздача алиасов ниже берет ПЕРВОЕ совпадение - то есть от порядка
     # зависела бы еще и привязка алиаса к узлу.
     proxies.sort(key=lambda p: p["name"])
+    _check_node_floor(len(proxies))
     _write_if_changed(PROVIDER_FILE, _dump_clash_proxies(proxies))
     proxy_names = [p["name"] for p in proxies]
     codes = _load_iso_codes()
