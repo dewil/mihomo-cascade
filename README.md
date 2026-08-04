@@ -86,6 +86,7 @@ ssh <host> 'bash /tmp/mihomo-cascade/install.sh && rm -rf /tmp/mihomo-cascade'
 /usr/local/sbin/
   mihomo-build-config              — сборка config.yaml из подписки + правил
   mihomo-refresh                   — пересборка + hot reload без рестарта
+  mihomo-api                       — чтение Clash API: соединения, группы, задержки
   check-route                      — проверка IP напрямую и через туннель
 /etc/systemd/system/mihomo.service — systemd unit
 /etc/cron.d/mihomo-refresh         — cron: обновление каждую минуту
@@ -102,6 +103,7 @@ ssh <host> 'bash /tmp/mihomo-cascade/install.sh && rm -rf /tmp/mihomo-cascade'
   - Hot reload (`PUT /configs?force=true`) выполняется только если итоговый `config.yaml` побайтово отличается от предыдущего. Если ни подписка, ни правила не изменились — mihomo не дёргаем.
   - Перед подгрузкой конфиг проверяется самим бинарём (`mihomo -t`). Не прошёл — откатываемся на предыдущую копию (`config.yaml.autobak`) и пишем строку в journal, в работе остаётся то, что работало.
   - Упал сам `PUT` — конфиг тоже откатывается: иначе на диске лежала бы версия, которой нет в работе, и следующий прогон, увидев совпадение хэшей, не повторил бы попытку.
+- TUN-режим: mihomo создаёт интерфейс `tun0`, управляет маршрутизацией автоматически (на ядрах с включённым IPv6 — через `auto-route`, иначе через `mihomo-policy-route` или ручную iptables-разметку).
 
 ### Защита от усохшего списка узлов
 
@@ -124,7 +126,6 @@ journalctl -t mihomo-refresh --since '24 hours ago'
 ### Про `force` в reload
 
 `force=true` оставлен сознательно. Проверено на ru3 (mihomo 1.19.25, 2026-08-04): активные соединения рвутся при reload **одинаково** и с `force`, и без него — поток через `7890` умирает в обоих случаях, а без reload доживает до конца. То есть снятие `force` разрывы не лечит, зато правки в `config.base.yaml` (порты, листенеры) без него не применятся. Единственная защита от разрывов — не дёргать reload зря, этим занимается сверка хэшей.
-- TUN-режим: mihomo создаёт интерфейс `tun0`, управляет маршрутизацией автоматически (на ядрах с включённым IPv6 — через `auto-route`, иначе через `mihomo-policy-route` или ручную iptables-разметку).
 
 ## Настройка под новый сервер
 
@@ -160,6 +161,10 @@ systemctl status mihomo       # статус
 systemctl restart mihomo      # перезапуск
 journalctl -u mihomo -f       # логи
 mihomo-refresh                # ручное обновление подписки
+mihomo-api conns              # живые соединения: хост, правило, цепочка, трафик
+mihomo-api conns instagram    # то же с фильтром по подстроке
+mihomo-api groups             # группы и выбранный в каждой узел с задержкой
+mihomo-api delay de2          # замер задержки узла или группы
 check-route                   # проверка маршрутов
 ```
 

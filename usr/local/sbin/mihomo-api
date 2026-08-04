@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+"""
+Тонкая обертка над Clash API работающего mihomo (external-controller).
+
+Отвечает на вопросы, на которые по журналу приходится гадать: куда сейчас идет
+трафик, по какому правилу он туда попал, какой узел выбран в группе и сколько
+до него миллисекунд.
+
+    mihomo-api conns [подстрока]   активные соединения: хост, правило, цепочка, трафик
+    mihomo-api groups              группы и выбранный в каждой узел
+    mihomo-api delay <имя> [url]   замер задержки узла или группы
+
+Только чтение: ничего не переключает и не применяет. Адрес API берется из
+MIHOMO_API (по умолчанию http://127.0.0.1:9090), пароль - из secret в
+/etc/mihomo/config.yaml, если он там задан.
+"""
+from __future__ import annotations
+
+import json
+import os
+import pathlib
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+API = os.environ.get("MIHOMO_API", "http://127.0.0.1:9090")
+CFG = pathlib.Path("/etc/mihomo/config.yaml")
+
+
+def _secret() -> str:
+    if not CFG.is_file():
+        return ""
+    for line in CFG.read_text(encoding="utf-8", errors="replace").splitlines():
+        s = line.split("#", 1)[0].strip()
+        if not s.startswith("secret:"):
+            continue
+        rest = s[len("secret:"):].strip()
+        if len(rest) >= 2 and rest[0] == rest[-1] and rest[0] in "\"'":
+            return rest[1:-1]
+        return rest
+    return ""
+
+
+def _get(path: str, timeout: int = 10):
+    req = urllib.request.Request(API + path)
+    sec = _secret()
+    if sec:
+        req.add_header("Authorization", f"Bearer {sec}")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        sys.exit(f"API ответил {e.code} на {path}: {e.read()[:200].decode('utf-8', 'replace')}")
+    except OSError as e:
+        sys.exit(f"Нет связи с {API}: {e}. mihomo запущен? external-controller на месте?")
+
+
+def _human(n: float) -> str:
+    for unit in ("Б", "КБ", "МБ", "ГБ"):
+        if n < 1024 or unit == "ГБ":
+            return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} ГБ"
+
+
+def cmd_conns(argv: list[str]) -> int:
+    needle = argv[0].lower() if argv else ""
+    data = _get("/connections")
+    conns = data.get("connections") or []
+
+    rows = []
+    for c in conns:
+        m = c.get("metadata", {})
+        host = m.get("host") or m.get("sniffHost") or m.get("destinationIP") or "?"
+        target = f"{host}:{m.get('destinationPort', '')}"
+        chain = " <- ".join(c.get("chains") or []) or "?"
+        rule = c.get("rule") or "?"
+        payload = c.get("rulePayload") or ""
+        traffic = (c.get("upload") or 0) + (c.get("download") or 0)
+        line = f"{target} {chain} {rule} {payload}".lower()
+        if needle and needle not in line:
+            continue
+        rows.append((traffic, target, chain, f"{rule}{'/' + payload if payload else ''}"))
+
+    rows.sort(reverse=True)
+    print(f"соединений: {len(rows)}"
+          + (f" (фильтр {needle!r} из {len(conns)})" if needle else "")
+          + f", всего вверх {_human(data.get('uploadTotal', 0))}"
+          + f" / вниз {_human(data.get('downloadTotal', 0))}")
+    if not rows:
+        return 0
+    print(f"{'трафик':>10}  {'назначение':<42} {'цепочка':<28} правило")
+    for traffic, target, chain, rule in rows[:40]:
+        print(f"{_human(traffic):>10}  {target[:42]:<42} {chain[:28]:<28} {rule}")
+    if len(rows) > 40:
+        print(f"... и еще {len(rows) - 40}")
+
+    # Сводка по группам: куда трафик уходит на самом деле, а не по задумке правил.
+    by_chain: dict[str, list[int]] = {}
+    for traffic, _, chain, _ in rows:
+        agg = by_chain.setdefault(chain.split(" <- ")[-1], [0, 0])
+        agg[0] += 1
+        agg[1] += traffic
+    print("\nпо выходам:")
+    for name, (count, traffic) in sorted(by_chain.items(), key=lambda x: -x[1][1]):
+        print(f"  {name:<20} {count:>4} соед., {_human(traffic)}")
+    return 0
+
+
+def cmd_groups(_argv: list[str]) -> int:
+    proxies = _get("/proxies").get("proxies", {})
+    groups = {k: v for k, v in proxies.items()
+              if v.get("type") in ("Selector", "URLTest", "Fallback", "LoadBalance")}
+    for name in sorted(groups):
+        g = groups[name]
+        now = g.get("now") or "-"
+        node = proxies.get(now, {})
+        history = node.get("history") or []
+        delay = f"{history[-1].get('delay')} мс" if history and history[-1].get("delay") else "нет замера"
+        print(f"{name:<10} {g.get('type'):<10} -> {now:<32} {delay}")
+    return 0
+
+
+def cmd_delay(argv: list[str]) -> int:
+    if not argv:
+        sys.exit("нужно имя узла или группы: mihomo-api delay <имя> [url]")
+    name = argv[0]
+    url = argv[1] if len(argv) > 1 else "https://www.gstatic.com/generate_204"
+    q = urllib.parse.urlencode({"url": url, "timeout": "5000"})
+    res = _get(f"/proxies/{urllib.parse.quote(name)}/delay?{q}", timeout=15)
+    print(f"{name}: {res.get('delay')} мс (через {url})")
+    return 0
+
+
+COMMANDS = {"conns": cmd_conns, "groups": cmd_groups, "delay": cmd_delay}
+
+
+def main() -> int:
+    argv = sys.argv[1:]
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    cmd = COMMANDS.get(argv[0])
+    if not cmd:
+        sys.exit(f"неизвестная команда {argv[0]!r}. Есть: {', '.join(COMMANDS)}")
+    return cmd(argv[1:])
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
