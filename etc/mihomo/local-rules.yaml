@@ -7,3 +7,11 @@ rules:
   # XMPP/GTalk port 5222: Google отключил endpoint, клиенты бесконечно ретраят
   # и засоряют warning-лог. Отвечаем REJECT, чтобы не висел timeout.
   - "DST-PORT,5222,REJECT"
+
+  # Агрегатор подписки и NPM перед ним живут на RU-адресе, а exit-ноды шлют
+  # geoip:ru и tld-ru в blackhole (xray, 03_routing.json) - запрос, ушедший
+  # через exit, получает 000, и клиент остаётся без обновления подписки.
+  # Центральные правила и так уводят его DIRECT; дублируем локально, чтобы это
+  # не зависело от того, что отдаст агрегатор правил.
+  - "DOMAIN,sub.cactushub.app,DIRECT"
+  - "DOMAIN,npm.cactushub.app,DIRECT"
