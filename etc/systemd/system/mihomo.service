@@ -11,7 +11,11 @@ Group=mihomo
 WorkingDirectory=/etc/mihomo
 ExecStartPre=+/usr/local/sbin/mihomo-build-config
 ExecStart=/usr/local/bin/mihomo -d /etc/mihomo
-Restart=on-failure
+# always, а не on-failure: при ЧИСТОМ выходе (SIGTERM от чужого скрипта, ручной
+# kill, промах pkill по шаблону) systemd считает остановку штатной и ноду обратно
+# не поднимает. Поймано 2026-08-05 на ru3 - прокси лежал 1,5 минуты.
+# `systemctl stop` при Restart=always по-прежнему останавливает штатно.
+Restart=always
 RestartSec=5
 LimitNOFILE=1048576
 # TUN: создание интерфейса и маршруты (ip rule / nftables)
