@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Скачивает подписку, сопоставляет узлы с алиасами (ISO 3166-1 alpha-2: xx, xx2, xx3),
-собирает /etc/mihomo/config.yaml из config.base.yaml + сгенерированные proxy-providers/groups/rules.
+собирает /etc/mihomo/config.yaml из config.base.yaml + узлы статикой, группы по
+алиасам и правила.
 """
 from __future__ import annotations
 
@@ -25,7 +26,12 @@ SUB_URL = BASE / "subscription.url"
 MIN_NODES_RATIO = float(os.environ.get("MIHOMO_MIN_NODES_RATIO", "0.7"))
 MIN_NODES_ABS = int(os.environ.get("MIHOMO_MIN_NODES_ABS", "3"))
 ALLOW_SHRINK = os.environ.get("MIHOMO_ALLOW_SHRINK", "") not in ("", "0")
+# Legacy: до 2026-08-05 узлы жили в файле провайдера, а config.yaml ссылался на
+# него через proxy-providers. Теперь узлы инлайнятся прямо в конфиг (перечитывание
+# провайдера рвало живые соединения при reload), файл больше не пишется - остался
+# только как источник базы для порога на первом прогоне после обновления.
 PROVIDER_FILE = BASE / "providers" / "vless_sub.yaml"
+STATE_FILE = BASE / "build-state.json"
 BASE_CFG = BASE / "config.base.yaml"
 ROUTING_RULES = BASE / "routing-rules.yaml"
 ROUTING_RULES_URL = BASE / "routing-rules.url"
@@ -68,9 +74,9 @@ def _read_subscription_url() -> str:
 
 
 def _download_subscription(url: str) -> bytes:
-    """Скачивает подписку и отдает ее СЫРЫЕ байты, не трогая PROVIDER_FILE.
+    """Скачивает подписку и отдает ее СЫРЫЕ байты, минуя каталоги mihomo.
 
-    Раньше сырая подписка сначала клалась в сам PROVIDER_FILE, и только потом
+    Раньше сырая подписка сначала клалась в файл провайдера, и только потом
     он перезаписывался YAML-ом. mihomo следит за этим файлом и перечитывает его
     по изменению - и попадал в промежуточное окно, где вместо списка прокси
     лежит base64. В журнале это 161 ошибка за сутки вида
@@ -136,12 +142,36 @@ def _write_if_changed(path: pathlib.Path, text: str, *, owner: str = "root:mihom
     return True
 
 
+def _save_state(node_count: int) -> None:
+    """Явное состояние последней ПРИНЯТОЙ сборки - база для порога по узлам."""
+    tmp = STATE_FILE.with_name(STATE_FILE.name + ".new")
+    tmp.write_text(json.dumps({"node_count": node_count}) + "\n", encoding="utf-8")
+    subprocess.run(["chown", "root:mihomo", str(tmp)], check=False)
+    subprocess.run(["chmod", "640", str(tmp)], check=False)
+    tmp.replace(STATE_FILE)
+
+
 def _previous_node_count() -> int:
-    """Сколько узлов лежит в текущем файле провайдера. 0 - файла нет."""
-    if not PROVIDER_FILE.is_file():
-        return 0
-    text = PROVIDER_FILE.read_text(encoding="utf-8", errors="replace")
-    return len(re.findall(r"^  - name:", text, flags=re.MULTILINE))
+    """Сколько узлов было в прошлой принятой сборке. 0 - сравнивать не с чем.
+
+    Состояние держим отдельным файлом, а не выводим из артефактов: раньше база
+    бралась из файла провайдера, но провайдера больше нет (узлы инлайнятся в
+    конфиг). Фолбэки нужны ровно на один прогон после обновления ноды.
+    """
+    if STATE_FILE.is_file():
+        try:
+            return int(json.loads(STATE_FILE.read_text(encoding="utf-8"))["node_count"])
+        except (ValueError, KeyError, TypeError):
+            print(f"Битый {STATE_FILE}, порог по узлам пропускаю.", file=sys.stderr)
+            return 0
+    # Нода еще на прошлой версии билдера: считаем по тому, что есть на диске.
+    for path in (PROVIDER_FILE, OUT_CFG):
+        if path.is_file():
+            text = path.read_text(encoding="utf-8", errors="replace")
+            count = len(re.findall(r"^  - name: \"", text, flags=re.MULTILINE))
+            if count:
+                return count
+    return 0
 
 
 def _check_node_floor(new_count: int) -> None:
@@ -528,43 +558,40 @@ def _emit_aliases_yaml(aliases: Dict[str, str]) -> None:
     subprocess.run(["chmod", "640", str(ALIASES_OUT)], check=False)
 
 
-def _yaml_escape_filter(name: str) -> str:
-    return re.escape(name)
-
-
 def _build_generated(
+    proxies: List[Dict[str, Any]],
     assigned: Dict[str, str],
     rules: List[str],
     aliases: Dict[str, str],
 ) -> str:
+    """config.yaml = узлы статикой + группы по алиасам + правила.
+
+    Раньше узлы приезжали через `proxy-providers: type: file`, а группы ссылались
+    на провайдера через `use:`. Оказалось, что именно перечитывание провайдера и
+    рвет живые соединения при reload: замеры на ru3 2026-08-05 - файловый
+    провайдер 4 разрыва из 8 прогонов, те же узлы статикой 0 из 8, контроль без
+    reload 0 из 6; `force` в reload на это не влияет. Провайдер был лишь способом
+    доставки, разобранные узлы у нас и так на руках - поэтому пишем их прямо в
+    конфиг.
+    """
     referenced: Set[str] = set()
     for r in rules:
         pol = _rule_policy(r)
         if pol and pol not in BUILTIN_POLICIES:
             referenced.add(pol)
 
-    # Группы с реальным узлом
-    blocks_pp: List[str] = []
+    # Группы с реальным узлом. url-test с единственным участником вместо select:
+    # автопереключать все равно не на что, но health-check сохраняется - раньше
+    # его давал провайдер, и на нем держится замер задержки в mihomo-api groups.
     blocks_pg: List[str] = []
     for alias, pname in sorted(assigned.items(), key=lambda x: _alias_sort_key(x[0])):
-        prov = re.sub(r"[^a-zA-Z0-9_]", "_", f"sub_{alias}")
-        flt = _yaml_escape_filter(pname)
-        blocks_pp.append(
-            f"""  {prov}:
-    type: file
-    path: ./providers/vless_sub.yaml
-    filter: "{flt}"
-    health-check:
-      enable: true
-      url: https://www.gstatic.com/generate_204
-      interval: 600
-"""
-        )
         blocks_pg.append(
             f"""  - name: {alias}
-    type: select
-    use:
-      - {prov}
+    type: url-test
+    url: https://www.gstatic.com/generate_204
+    interval: 600
+    proxies:
+      - {json.dumps(pname, ensure_ascii=False)}
 """
         )
 
@@ -586,9 +613,8 @@ def _build_generated(
     for r in rules:
         rules_lines.append(f"  - {json.dumps(r, ensure_ascii=False)}")
 
-    pp = "proxy-providers:\n" + "\n".join(blocks_pp) if blocks_pp else "proxy-providers: {}"
     pg = "proxy-groups:\n" + "\n".join(blocks_pg) if blocks_pg else "proxy-groups: []"
-    parts = [pp, pg, "\n".join(rules_lines)]
+    parts = [_dump_clash_proxies(proxies), pg, "\n".join(rules_lines)]
     return "\n".join(parts) + "\n"
 
 
@@ -611,22 +637,22 @@ def main() -> int:
         )
         sys.exit(1)
     # Агрегатор временами отдает те же узлы в другом порядке. Без сортировки
-    # это давало новый файл провайдера каждую минуту (и лишний pull у mihomo),
-    # а раздача алиасов ниже берет ПЕРВОЕ совпадение - то есть от порядка
-    # зависела бы еще и привязка алиаса к узлу.
+    # конфиг менялся бы на ровном месте (а значит и лишний reload), плюс раздача
+    # алиасов ниже берет ПЕРВОЕ совпадение - то есть от порядка зависела бы еще
+    # и привязка алиаса к узлу.
     proxies.sort(key=lambda p: p["name"])
     _check_node_floor(len(proxies))
-    _write_if_changed(PROVIDER_FILE, _dump_clash_proxies(proxies))
     proxy_names = [p["name"] for p in proxies]
     codes = _load_iso_codes()
     aliases = _build_alias_regexes(codes)
     _emit_aliases_yaml(aliases)
     assigned = _assign_aliases(proxy_names, aliases)
     rules = _load_local_rules() + _load_routing_rules()
-    gen = _build_generated(assigned, rules, aliases)
+    gen = _build_generated(proxies, assigned, rules, aliases)
 
     base = BASE_CFG.read_text(encoding="utf-8").rstrip() + "\n\n"
     _write_if_changed(OUT_CFG, base + gen)
+    _save_state(len(proxies))
     return 0
 
 
