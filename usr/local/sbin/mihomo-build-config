@@ -615,7 +615,38 @@ def _build_generated(
 
     pg = "proxy-groups:\n" + "\n".join(blocks_pg) if blocks_pg else "proxy-groups: []"
     parts = [_dump_clash_proxies(proxies), pg, "\n".join(rules_lines)]
-    return "\n".join(parts) + "\n"
+    groups = set(assigned) | {p for p in referenced if p not in BUILTIN_POLICIES}
+    return "\n".join(parts) + "\n", groups
+
+
+_LISTENER_PROXY_RE = re.compile(r"^\s*-\s*\{[^}]*\bproxy:\s*([A-Za-z0-9_-]+)\s*\}\s*$")
+
+
+def _strip_orphan_listeners(base_text: str, groups: Set[str]) -> str:
+    """Выкинуть листенеры, чьей группы в этой сборке нет.
+
+    Листенеры живут в статическом config.base.yaml, а группы генерятся из
+    подписки. Выводим ноду - группа исчезает, листенер остается, mihomo молча
+    его не поднимает, и порт просто закрыт. Снаружи это выглядит как отказ
+    диагностики: проба каскада из cactus-adm получает timeout и алертит, хотя
+    ломать нечего. Поймано 2026-08-06 на выводе ноды it.
+    """
+    kept: List[str] = []
+    dropped: List[str] = []
+    for line in base_text.splitlines():
+        m = _LISTENER_PROXY_RE.match(line)
+        if m and m.group(1) not in groups and m.group(1) not in BUILTIN_POLICIES:
+            dropped.append(m.group(1))
+            continue
+        kept.append(line)
+    if dropped:
+        print(
+            "Листенеры без своей группы убраны из конфига: "
+            f"{', '.join(sorted(set(dropped)))}. "
+            "Если нода вернется в подписку - вернутся сами.",
+            file=sys.stderr,
+        )
+    return "\n".join(kept)
 
 
 def main() -> int:
@@ -648,9 +679,10 @@ def main() -> int:
     _emit_aliases_yaml(aliases)
     assigned = _assign_aliases(proxy_names, aliases)
     rules = _load_local_rules() + _load_routing_rules()
-    gen = _build_generated(proxies, assigned, rules, aliases)
+    gen, groups = _build_generated(proxies, assigned, rules, aliases)
 
-    base = BASE_CFG.read_text(encoding="utf-8").rstrip() + "\n\n"
+    base = _strip_orphan_listeners(BASE_CFG.read_text(encoding="utf-8"), groups)
+    base = base.rstrip() + "\n\n"
     _write_if_changed(OUT_CFG, base + gen)
     _save_state(len(proxies))
     return 0

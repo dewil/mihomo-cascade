@@ -31,7 +31,7 @@ listeners:
   - { name: trace-de,  type: socks, listen: 127.0.0.1, port: 7901, proxy: de }
   - { name: trace-de2, type: socks, listen: 127.0.0.1, port: 7902, proxy: de2 }
   - { name: trace-ee,  type: socks, listen: 127.0.0.1, port: 7903, proxy: ee }
-  - { name: trace-it,  type: socks, listen: 127.0.0.1, port: 7904, proxy: it }
+  # 7904 (trace-it) свободен: нода it выведена из подписки 2026-08-06.
   - { name: trace-pl,  type: socks, listen: 127.0.0.1, port: 7905, proxy: pl }
   - { name: trace-de3, type: socks, listen: 127.0.0.1, port: 7906, proxy: de3 }
 
