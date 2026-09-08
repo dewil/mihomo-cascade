@@ -112,6 +112,13 @@ check "интервал две минуты" \
   "$(unit "$UNITS/mihomo-refresh.timer" | grep -Eqi '^(OnUnitActiveSec|OnUnitInactiveSec)=(2min|2m|120s?)$|^OnCalendar=\*:0/2$' && echo да || echo нет)" "да"
 check "случайная задержка до минуты" \
   "$(unit "$UNITS/mihomo-refresh.timer" | grep -Eqi '^RandomizedDelaySec=(59s?|60s?|1min|1m)$' && echo да || echo нет)" "да"
+# Дописано 08.09.2026 после уточнения спеки: сам джиттер бесполезен без явной
+# точности. По умолчанию systemd вправе сдвигать запуск в окне до минуты, группируя
+# пробуждения, - и эта группировка возвращает синхронный залп машин, против которого
+# сделана вся фича. Проверка мутационная: снятие строки AccuracySec из юнита обязано
+# красить тест.
+check "точность задана явно (иначе группировка съедает джиттер)" \
+  "$(unit "$UNITS/mihomo-refresh.timer" | grep -Eqi '^AccuracySec=(1s?|1sec)$' && echo да || echo нет)" "да"
 check "таймаут прогона 300 с" \
   "$(unit "$UNITS/mihomo-refresh.service" | grep -Eqi '^TimeoutStartSec=(300s?|5min|5m)$' && echo да || echo нет)" "да"
 check "запускается команда обновления" \

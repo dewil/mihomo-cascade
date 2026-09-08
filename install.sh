@@ -1,6 +1,83 @@
 #!/bin/bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Шаг планировщика обновления: пара systemd-юнитов вместо прежнего /etc/cron.d.
+#
+# Почему функция и почему в самом начале файла. Шаг обязан быть проверяемым без
+# установки в систему: тесты (tests/scheduler-install.sh) зовут его отдельно,
+# `install.sh --step scheduler`, без прав root и без скачиваний. Разбор этого
+# аргумента идет до всего остального - до определения архитектуры и до проверки
+# root, иначе шаг не выполнить на машине, где нет ни того, ни другого.
+#
+# DESTDIR - префикс всех путей файловой системы на этом шаге. Пустой при боевой
+# установке, каталог песочницы в тестах: боевой /etc при прогоне тестов не
+# трогается вовсе.
+install_scheduler() {
+  local dest="${DESTDIR:-}"
+  local src="${SOURCE_DIR:-$SCRIPT_DIR}"
+  local units_dir="${dest}/etc/systemd/system"
+  local cron_legacy="${dest}/etc/cron.d/mihomo-refresh"
+
+  # Без systemd ставить планировщик некуда, и молчаливое продолжение тут
+  # недопустимо: ровно так стоял home-server - файл расписания на месте, демона
+  # нет, конфиг заморожен месяц, а установка отрапортовала успех.
+  if ! command -v systemctl >/dev/null 2>&1; then
+    echo "ОШИБКА: systemctl не найден, systemd в системе нет - планировщик обновления поставить некуда." >&2
+    return 1
+  fi
+
+  install -d -m 755 "${units_dir}"
+  install -m 644 "${src}/etc/systemd/system/mihomo-refresh.service" "${units_dir}/mihomo-refresh.service"
+  install -m 644 "${src}/etc/systemd/system/mihomo-refresh.timer"   "${units_dir}/mihomo-refresh.timer"
+
+  # Прежний планировщик снимается здесь же, а не руками администратора: иначе на
+  # обновленной ноде окажутся два расписания разом и обновление пойдет вдвое
+  # чаще задуманного. Трогаем ровно свой файл - в crontab пользователя root мы
+  # никогда не писали, и удалять чужие записи по совпадению имени не будем.
+  if [ -e "${cron_legacy}" ]; then
+    rm -f "${cron_legacy}"
+    echo "  -> снят прежний ${cron_legacy#"$dest"} (его заменил таймер)"
+  fi
+
+  if ! systemctl daemon-reload; then
+    echo "ОШИБКА: systemctl daemon-reload не отработал; юниты уложены в ${units_dir}, таймер не поднят." >&2
+    return 1
+  fi
+  if ! systemctl enable --now mihomo-refresh.timer; then
+    echo "ОШИБКА: не удалось включить и запустить mihomo-refresh.timer; юниты уложены в ${units_dir}." >&2
+    return 1
+  fi
+  # enable --now не перезапускает уже активный таймер, поэтому на обновлении
+  # новое расписание вступило бы в силу только после перезагрузки машины.
+  if ! systemctl restart mihomo-refresh.timer; then
+    echo "ОШИБКА: mihomo-refresh.timer не перезапустился с новым расписанием; юниты уложены в ${units_dir}." >&2
+    return 1
+  fi
+
+  # Спрашиваем систему о фактическом состоянии, а не печатаем успех по факту
+  # того, что команды были отданы: прежний шаг выглядел одинаково на машине, где
+  # обновление работает, и на машине, где его не будет никогда.
+  if ! systemctl is-enabled mihomo-refresh.timer >/dev/null 2>&1; then
+    echo "ОШИБКА: mihomo-refresh.timer не включен в автозагрузку (systemctl is-enabled) - после перезагрузки нода обновляться не будет. Юниты уложены в ${units_dir}." >&2
+    return 1
+  fi
+  if ! systemctl is-active mihomo-refresh.timer >/dev/null 2>&1; then
+    echo "ОШИБКА: mihomo-refresh.timer не активен (systemctl is-active) - нода не обновляется прямо сейчас. Юниты уложены в ${units_dir}." >&2
+    return 1
+  fi
+
+  echo "  -> планировщик: systemd timer, раз в 2 мин со случайной задержкой до 59 с"
+}
+
+if [ "${1:-}" = "--step" ]; then
+  case "${2:-}" in
+    scheduler) install_scheduler || exit $?; exit 0 ;;
+    *) echo "Неизвестный шаг: ${2:-<пусто>} (известен: scheduler)" >&2; exit 1 ;;
+  esac
+fi
+
 MIHOMO_VERSION="v1.19.25"
 GITHUB_REPO="${GITHUB_REPO:-dewil/mihomo-cascade}"
 GITHUB_REF="${GITHUB_REF:-main}"
@@ -37,7 +114,6 @@ if [ "$ARCH_DL" = "amd64" ] && ! supports_x86_64_v3; then
   ARCH_DL="amd64-compatible"
 fi
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TMP_FETCH=""
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -106,7 +182,7 @@ prepare_source_dir() {
     return
   fi
   TMP_FETCH="$(mktemp -d)"
-  mkdir -p "${TMP_FETCH}/etc/mihomo" "${TMP_FETCH}/etc/systemd/system" "${TMP_FETCH}/etc/cron.d" "${TMP_FETCH}/usr/local/sbin"
+  mkdir -p "${TMP_FETCH}/etc/mihomo" "${TMP_FETCH}/etc/systemd/system" "${TMP_FETCH}/usr/local/sbin"
 
   fetch_from_github "etc/mihomo/config.base.yaml" "${TMP_FETCH}/etc/mihomo/config.base.yaml"
   fetch_from_github "etc/mihomo/subscription.url" "${TMP_FETCH}/etc/mihomo/subscription.url"
@@ -115,7 +191,8 @@ prepare_source_dir() {
   fetch_from_github "etc/mihomo/iso3166_alpha2.txt" "${TMP_FETCH}/etc/mihomo/iso3166_alpha2.txt"
   fetch_from_github "etc/mihomo/local-rules.yaml" "${TMP_FETCH}/etc/mihomo/local-rules.yaml"
   fetch_from_github "etc/systemd/system/mihomo.service" "${TMP_FETCH}/etc/systemd/system/mihomo.service"
-  fetch_from_github "etc/cron.d/mihomo-refresh" "${TMP_FETCH}/etc/cron.d/mihomo-refresh"
+  fetch_from_github "etc/systemd/system/mihomo-refresh.service" "${TMP_FETCH}/etc/systemd/system/mihomo-refresh.service"
+  fetch_from_github "etc/systemd/system/mihomo-refresh.timer" "${TMP_FETCH}/etc/systemd/system/mihomo-refresh.timer"
   fetch_from_github "usr/local/sbin/mihomo-build-config" "${TMP_FETCH}/usr/local/sbin/mihomo-build-config"
   fetch_from_github "usr/local/sbin/mihomo-refresh" "${TMP_FETCH}/usr/local/sbin/mihomo-refresh"
   fetch_from_github "usr/local/sbin/check-route" "${TMP_FETCH}/usr/local/sbin/check-route"
@@ -219,16 +296,10 @@ install -m 644 "${SOURCE_DIR}/etc/systemd/system/mihomo.service" /etc/systemd/sy
 systemctl daemon-reload
 echo "  -> mihomo.service установлен"
 
-echo "=== 8. Устанавливаем cron ==="
-install -m 644 "${SOURCE_DIR}/etc/cron.d/mihomo-refresh" /etc/cron.d/mihomo-refresh
-if command -v systemctl >/dev/null 2>&1; then
-  if systemctl list-unit-files | awk '{print $1}' | grep -qx "cron.service"; then
-    systemctl enable --now cron >/dev/null 2>&1 || true
-  elif systemctl list-unit-files | awk '{print $1}' | grep -qx "crond.service"; then
-    systemctl enable --now crond >/dev/null 2>&1 || true
-  fi
-fi
-echo "  -> cron установлен (обновление подписки каждую минуту)"
+echo "=== 8. Устанавливаем планировщик обновления ==="
+# Ошибка шага роняет установку (set -e): нода без планировщика не обновляется,
+# и узнать об этом по выводу установщика раньше было нельзя.
+install_scheduler
 
 echo "=== 9. Запускаем ==="
 systemctl enable mihomo
