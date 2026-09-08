@@ -71,6 +71,33 @@ exit 0
 STUB
 chmod +x "$SB/bin/systemctl"
 
+# Подставные install и rm. Нужны находке 1 сверки: шаг зовется как
+# `install_scheduler || exit $?`, и bash в таком контексте снимает errexit со
+# всего тела функции - значит проваленные файловые операции надо уметь
+# воспроизвести, а не рассуждать о них. В штатных режимах стуб прозрачен и
+# просто вызывает настоящую команду.
+REAL_INSTALL="$(command -v install)"
+REAL_RM="$(command -v rm)"
+cat > "$SB/bin/install" <<STUB
+#!/usr/bin/env bash
+MODE="\$(cat "$MODEF" 2>/dev/null || echo ok)"
+if [[ "\$MODE" == installfail ]]; then
+  echo "install: cannot create regular file: stub failure" >&2
+  exit 1
+fi
+exec "$REAL_INSTALL" "\$@"
+STUB
+cat > "$SB/bin/rm" <<STUB
+#!/usr/bin/env bash
+MODE="\$(cat "$MODEF" 2>/dev/null || echo ok)"
+if [[ "\$MODE" == rmfail ]]; then
+  echo "rm: cannot remove: stub failure" >&2
+  exit 1
+fi
+exec "$REAL_RM" "\$@"
+STUB
+chmod +x "$SB/bin/install" "$SB/bin/rm"
+
 # purebin - PATH без systemctl вообще (сценарий "systemd в системе нет").
 for t in bash sh cat cp mv rm mkdir rmdir ln chmod chown install sed grep egrep awk \
          cut tr head tail sort uniq wc date id dirname basename find printf env true false \
@@ -86,10 +113,12 @@ reset() { # $1 = режим заглушки
   rm -rf "$SB/root"; mkdir -p "$SB/root/etc"
   : > "$LOG"; printf '%s\n' "$1" > "$MODEF"
 }
+SRC=""   # каталог-источник юнитов; пусто = сам репозиторий
 invoke() { # [$1 = nosystemctl] ; печатает код возврата, вывод в $OUT
   local path="$SB/bin:$PATH"
   [[ "${1:-}" == nosystemctl ]] && path="$SB/purebin"
-  env PATH="$path" DESTDIR="$SB/root" bash "$INSTALLER" --step scheduler >"$OUT" 2>&1
+  env PATH="$path" DESTDIR="$SB/root" SOURCE_DIR="${SRC:-$ROOT}" \
+    bash "$INSTALLER" --step scheduler >"$OUT" 2>&1
   echo $?
 }
 unit() { cat "$1" 2>/dev/null | tr -d ' \t'; }   # сравнение без оглядки на пробелы
@@ -132,7 +161,14 @@ check "зависший прогон снимается по таймауту" \
   "$(unit "$UNITS/mihomo-refresh.service" | grep -Eqi '^TimeoutStartSec=' && echo да || echo нет)" "да"
 check "таймаут не бесконечный" \
   "$(unit "$UNITS/mihomo-refresh.service" | grep -Eqi '^TimeoutStartSec=(0|infinity)$' && echo да || echo нет)" "нет"
-check "ExecStart без flock" "$(grepq '^ExecStart=.*flock' "$UNITS/mihomo-refresh.service")" "нет"
+# Перевернуто 08.09.2026 по находке 2 сверки. Прежняя редакция требовала
+# ExecStart БЕЗ flock и опиралась на спеку ("systemd не стартует второй экземпляр
+# своего юнита, лок не нужен"). Утверждение верно только для экземпляров этого
+# юнита: старый cron-прогон в окне миграции ему не подчиняется, а временные файлы
+# у них общие. Лок вернулся, спека уточнена - см. "Уточнения после сверки".
+check "ExecStart берет лок" "$(grepq '^ExecStart=.*flock' "$UNITS/mihomo-refresh.service")" "да"
+check "лок тот же, что брал прежний крон" \
+  "$(grepq '^ExecStart=.*/run/mihomo-refresh\.lock' "$UNITS/mihomo-refresh.service")" "да"
 
 echo "D. FR-CASC-TIMER-06: итог называет фактическое расписание"
 check "названо реальное расписание" "$(grepq '(две минуты|2 мин|2 минут)' "$OUT")" "да"
@@ -193,6 +229,90 @@ for mode in notactive notenabled enablefail; do
   check "[$mode] прежний cron.d на месте" "$([[ -e "$CRON" ]] && echo есть || echo нет)" "есть"
   check "[$mode] в выводе сказано, что старое расписание цело" "$(grepq '(cron\.d не тронут|не тронуто)' "$OUT")" "да"
 done
+
+echo "L. находка 1 сверки: провал файловой операции не выдается за успех"
+# Шаг вызывается как `install_scheduler || exit $?`, и bash в таком контексте
+# отключает errexit внутри всей функции: без явных проверок проваленные install и
+# rm доезжают до строки успеха, шаг возвращает 0, а вывод вдобавок утверждает, что
+# cron снят. Оба провала воспроизводятся подставными командами в PATH песочницы.
+reset installfail; RC=$(invoke)
+check "[install] код возврата ненулевой" "$([[ "$RC" -ne 0 ]] && echo да || echo нет)" "да"
+check "[install] названа причина словами шага" "$(grepq 'ОШИБКА.*(юнит|каталог)' "$OUT")" "да"
+check "[install] успеха не рапортует" "$(grepq '(две минуты|2 мин|2 минут)' "$OUT")" "нет"
+check "[install] юнитов на диске нет" \
+  "$([[ -f "$UNITS/mihomo-refresh.timer" || -f "$UNITS/mihomo-refresh.service" ]] && echo да || echo нет)" "нет"
+# Ключевая проверка этой ветки: шаг обязан оборваться НА файловой операции, а не
+# доковылять до systemctl. Мутационный прогон 08.09.2026 показал, зачем она нужна:
+# со снятыми проверками install шаг все равно падал - но уже на разборе
+# расписания, успев включить таймер, юнитов которого на диске нет. Провал по
+# коду возврата тут есть в обоих состояниях, и без этой строки тест молчал бы
+# одинаково.
+check "[install] шаг оборвался до вызова systemctl" "$(grepq '(enable|daemon-reload)' "$LOG")" "нет"
+
+reset rmfail
+mkdir -p "$SB/root/etc/cron.d"
+printf '*/2 * * * * root /usr/local/sbin/mihomo-refresh\n' > "$CRON"
+RC=$(invoke)
+check "[rm] код возврата ненулевой" "$([[ "$RC" -ne 0 ]] && echo да || echo нет)" "да"
+check "[rm] не утверждает, что cron снят" "$(grepq 'снят прежний' "$OUT")" "нет"
+check "[rm] успеха не рапортует" "$(grepq '(две минуты|2 мин|2 минут)' "$OUT")" "нет"
+check "[rm] cron.d и правда остался на месте" "$([[ -e "$CRON" ]] && echo есть || echo нет)" "есть"
+
+echo "M. находка 2 сверки: лок держит взаимное исключение и молча пропускает занятое"
+reset ok; RC=$(invoke)
+check "код возврата" "$RC" "0"
+# Форму вызова проверяем на настоящем flock, но в песочнице: боевой лок /run и
+# боевую команду подменяем на свои. Проверяется поведение (пропуск без ошибки),
+# а не текст строки - текст уже проверен статически в секции C.
+EXEC="$(sed -n 's/^ExecStart=//p' "$UNITS/mihomo-refresh.service" | head -n1)"
+LOCKF="$SB/refresh.lock"; RAN="$SB/ran.flag"
+cat > "$SB/bin/refresh-probe" <<'PROBE'
+#!/usr/bin/env bash
+printf 'ran\n' >> "$RAN_FLAG"
+PROBE
+chmod +x "$SB/bin/refresh-probe"
+CMD="${EXEC//\/run\/mihomo-refresh.lock/$LOCKF}"
+CMD="${CMD//\/usr\/local\/sbin\/mihomo-refresh/$SB/bin/refresh-probe}"
+
+: > "$RAN"
+env RAN_FLAG="$RAN" bash -c "$CMD" >/dev/null 2>&1
+check "[лок свободен] код возврата" "$?" "0"
+check "[лок свободен] прогон состоялся" "$(grepq 'ran' "$RAN")" "да"
+
+: > "$RAN"
+exec 9>"$LOCKF"
+if flock -n 9; then
+  # 9>&- : дочерний процесс не наследует наш дескриптор, иначе он держал бы лок
+  # той же записью открытия файла и конфликта бы не увидел.
+  env RAN_FLAG="$RAN" bash -c "$CMD" >/dev/null 2>&1 9>&-
+  RC=$?
+  flock -u 9
+  check "[лок занят] выход без ошибки (иначе journal сыплет failed)" "$RC" "0"
+  check "[лок занят] прогон НЕ состоялся" "$(grepq 'ran' "$RAN")" "нет"
+else
+  bad "не удалось взять лок песочницы $LOCKF - сценарий не проверен"
+fi
+exec 9>&-
+
+echo "N. находка 3 сверки: итог берет расписание из установленного юнита, а не из константы"
+# Подставной источник с другим расписанием: если строка успеха - константа, вывод
+# не изменится и тест покраснеет. Числа взяты нарочно непохожими на боевые.
+mkdir -p "$SB/src/etc/systemd/system"
+cp "$ROOT/etc/systemd/system/mihomo-refresh.service" "$SB/src/etc/systemd/system/"
+sed -e 's|^OnCalendar=.*|OnCalendar=*:0/7|' -e 's|^RandomizedDelaySec=.*|RandomizedDelaySec=30s|' \
+  "$ROOT/etc/systemd/system/mihomo-refresh.timer" > "$SB/src/etc/systemd/system/mihomo-refresh.timer"
+reset ok; SRC="$SB/src"; RC=$(invoke); SRC=""
+check "код возврата" "$RC" "0"
+check "названо расписание из юнита" "$(grepq 'раз в 7 мин' "$OUT")" "да"
+check "названа задержка из юнита" "$(grepq '30 с' "$OUT")" "да"
+check "боевых чисел в выводе нет" "$(grepq '(2 мин|59 с)' "$OUT")" "нет"
+
+# И обратно: на штатном юните обязана быть ровно подстрока из спеки (уточнение
+# 08.09.2026), иначе чтение из юнита сломало бы контракт вывода.
+reset ok; RC=$(invoke)
+check "код возврата" "$RC" "0"
+check "штатный вывод содержит 'раз в 2 мин'" "$(grepq 'раз в 2 мин' "$OUT")" "да"
+check "штатный вывод содержит задержку 59 с" "$(grepq '59 с' "$OUT")" "да"
 
 echo "J. песочница: боевая файловая система не тронута"
 check "боевой /etc/cron.d/mihomo-refresh на месте" \
