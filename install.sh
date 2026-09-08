@@ -14,6 +14,11 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # DESTDIR - префикс всех путей файловой системы на этом шаге. Пустой при боевой
 # установке, каталог песочницы в тестах: боевой /etc при прогоне тестов не
 # трогается вовсе.
+# Шаг планировщика отдельной функцией: его зовет и обычная установка, и
+# `install.sh --step scheduler` - режим для тестов и для доустановки на уже
+# развернутой ноде. На чистой машине этим режимом планировщик поднимать не надо:
+# сам /usr/local/sbin/mihomo-refresh ставится шагом 5, и без него таймер будет
+# исправно запускать несуществующую команду раз в две минуты.
 install_scheduler() {
   local dest="${DESTDIR:-}"
   local src="${SOURCE_DIR:-$SCRIPT_DIR}"
@@ -32,27 +37,18 @@ install_scheduler() {
   install -m 644 "${src}/etc/systemd/system/mihomo-refresh.service" "${units_dir}/mihomo-refresh.service"
   install -m 644 "${src}/etc/systemd/system/mihomo-refresh.timer"   "${units_dir}/mihomo-refresh.timer"
 
-  # Прежний планировщик снимается здесь же, а не руками администратора: иначе на
-  # обновленной ноде окажутся два расписания разом и обновление пойдет вдвое
-  # чаще задуманного. Трогаем ровно свой файл - в crontab пользователя root мы
-  # никогда не писали, и удалять чужие записи по совпадению имени не будем.
-  if [ -e "${cron_legacy}" ]; then
-    rm -f "${cron_legacy}"
-    echo "  -> снят прежний ${cron_legacy#"$dest"} (его заменил таймер)"
-  fi
-
   if ! systemctl daemon-reload; then
-    echo "ОШИБКА: systemctl daemon-reload не отработал; юниты уложены в ${units_dir}, таймер не поднят." >&2
+    echo "ОШИБКА: systemctl daemon-reload не отработал; юниты уложены в ${units_dir}, таймер не поднят. Прежнее расписание cron.d не тронуто - обновление на ноде продолжает работать по нему." >&2
     return 1
   fi
   if ! systemctl enable --now mihomo-refresh.timer; then
-    echo "ОШИБКА: не удалось включить и запустить mihomo-refresh.timer; юниты уложены в ${units_dir}." >&2
+    echo "ОШИБКА: не удалось включить и запустить mihomo-refresh.timer; юниты уложены в ${units_dir}, прежнее расписание cron.d не тронуто." >&2
     return 1
   fi
   # enable --now не перезапускает уже активный таймер, поэтому на обновлении
   # новое расписание вступило бы в силу только после перезагрузки машины.
   if ! systemctl restart mihomo-refresh.timer; then
-    echo "ОШИБКА: mihomo-refresh.timer не перезапустился с новым расписанием; юниты уложены в ${units_dir}." >&2
+    echo "ОШИБКА: mihomo-refresh.timer не перезапустился с новым расписанием; юниты уложены в ${units_dir}, прежнее расписание cron.d не тронуто." >&2
     return 1
   fi
 
@@ -60,12 +56,25 @@ install_scheduler() {
   # того, что команды были отданы: прежний шаг выглядел одинаково на машине, где
   # обновление работает, и на машине, где его не будет никогда.
   if ! systemctl is-enabled mihomo-refresh.timer >/dev/null 2>&1; then
-    echo "ОШИБКА: mihomo-refresh.timer не включен в автозагрузку (systemctl is-enabled) - после перезагрузки нода обновляться не будет. Юниты уложены в ${units_dir}." >&2
+    echo "ОШИБКА: mihomo-refresh.timer не включен в автозагрузку (systemctl is-enabled) - после перезагрузки нода обновляться не будет. Юниты уложены в ${units_dir}, прежнее расписание cron.d не тронуто." >&2
     return 1
   fi
   if ! systemctl is-active mihomo-refresh.timer >/dev/null 2>&1; then
-    echo "ОШИБКА: mihomo-refresh.timer не активен (systemctl is-active) - нода не обновляется прямо сейчас. Юниты уложены в ${units_dir}." >&2
+    echo "ОШИБКА: mihomo-refresh.timer не активен (systemctl is-active) - нода не обновляется прямо сейчас. Юниты уложены в ${units_dir}, прежнее расписание cron.d не тронуто." >&2
     return 1
+  fi
+
+  # Прежнее расписание снимается ТОЛЬКО здесь - после того, как таймер проверен
+  # живым. Порядок не косметический: если снять cron раньше и споткнуться на
+  # любой из проверок выше, нода останется вообще без планировщика, то есть в
+  # состоянии хуже, чем до запуска установщика. Пока проверки не прошли, старый
+  # cron продолжает обновлять ноду, и откат сводится к "ничего не делать".
+  #
+  # Трогаем ровно свой файл - в crontab пользователя root мы никогда не писали,
+  # и удалять чужие записи по совпадению имени не будем.
+  if [ -e "${cron_legacy}" ]; then
+    rm -f "${cron_legacy}"
+    echo "  -> снят прежний ${cron_legacy#"$dest"} (его заменил таймер)"
   fi
 
   echo "  -> планировщик: systemd timer, раз в 2 мин со случайной задержкой до 59 с"
