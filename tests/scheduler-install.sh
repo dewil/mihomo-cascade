@@ -85,6 +85,14 @@ if [[ "\$MODE" == installfail ]]; then
   echo "install: cannot create regular file: stub failure" >&2
   exit 1
 fi
+# Отдельный режим: каталог создается, падает копирование ЮНИТА. Без него
+# сценарий installfail ломает самый первый вызов (install -d), и снятие
+# проверок с копирования юнитов осталось бы незамеченным - проверка молчала бы
+# одинаково в исправном и сломанном состоянии (находка второго раунда сверки).
+if [[ "\$MODE" == unitcopyfail && "\$*" == *mihomo-refresh.timer* ]]; then
+  echo "install: cannot create regular file: stub failure (timer)" >&2
+  exit 1
+fi
 exec "$REAL_INSTALL" "\$@"
 STUB
 cat > "$SB/bin/rm" <<STUB
@@ -313,6 +321,26 @@ reset ok; RC=$(invoke)
 check "код возврата" "$RC" "0"
 check "штатный вывод содержит 'раз в 2 мин'" "$(grepq 'раз в 2 мин' "$OUT")" "да"
 check "штатный вывод содержит задержку 59 с" "$(grepq '59 с' "$OUT")" "да"
+
+echo "O. второй раунд сверки: разбор расписания строг, копирование юнита проверяется отдельно"
+# O1. Календарное выражение с секундами - допустимое для systemd, но НЕ форма
+# "*:0/N": прежний шаблон принимал его и печатал "раз в 2:30 мин", смешивая
+# минуты с секундами. Такое расписание уходит в буквальный вывод.
+mkdir -p "$SB/src/etc/systemd/system"
+cp "$ROOT/etc/systemd/system/mihomo-refresh.service" "$SB/src/etc/systemd/system/"
+sed -e 's|^OnCalendar=.*|OnCalendar=*:0/2:30|' \
+  "$ROOT/etc/systemd/system/mihomo-refresh.timer" > "$SB/src/etc/systemd/system/mihomo-refresh.timer"
+reset ok; SRC="$SB/src"; RC=$(invoke); SRC=""
+check "код возврата" "$RC" "0"
+check "нештатный календарь не выдается за минуты" "$(grepq 'раз в 2:30 мин' "$OUT")" "нет"
+check "нештатный календарь назван как есть" "$(grepq 'по расписанию \*:0/2:30' "$OUT")" "да"
+
+# O2. Падение копирования ЮНИТА (каталог при этом создается) - отдельный от
+# installfail сценарий, см. комментарий у заглушки install.
+reset unitcopyfail; RC=$(invoke)
+check "код возврата ненулевой" "$([[ "$RC" -ne 0 ]] && echo да || echo нет)" "да"
+check "успеха не рапортует" "$(grepq '(раз в [0-9]+ мин|по расписанию)' "$OUT")" "нет"
+check "шаг оборвался до systemctl" "$([[ -s "$LOG" ]] && echo да || echo нет)" "нет"
 
 echo "J. песочница: боевая файловая система не тронута"
 check "боевой /etc/cron.d/mihomo-refresh на месте" \
