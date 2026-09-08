@@ -42,7 +42,7 @@ wget -qO- https://raw.githubusercontent.com/dewil/mihomo-cascade/main/install.sh
 `install.sh` сам определяет режим:
 
 - **fresh** — если `/etc/mihomo/subscription.url` пуст или отсутствует. Запрашивает URL подписки и URL правил маршрутизации интерактивно, заливает все конфиги, запускает mihomo.
-- **update** — если `/etc/mihomo/subscription.url` уже непустой. Обновляет только то, что репо считает источником правды: бинарник, `config.base.yaml`, `iso3166_alpha2.txt`, скрипты в `/usr/local/sbin/`, systemd unit, cron. **Не трогает** `subscription.url`, `routing-rules.url`, `routing-rules.yaml`. В конце делает `systemctl restart mihomo`, чтобы новый `mihomo-build-config` подхватился сразу.
+- **update** — если `/etc/mihomo/subscription.url` уже непустой. Обновляет только то, что репо считает источником правды: бинарник, `config.base.yaml`, `iso3166_alpha2.txt`, скрипты в `/usr/local/sbin/`, systemd-юниты (`mihomo.service`, `mihomo-refresh.service`, `mihomo-refresh.timer`). Прежний `/etc/cron.d/mihomo-refresh` при этом снимается автоматически - планировщик на ноде остается один. **Не трогает** `subscription.url`, `routing-rules.url`, `routing-rules.yaml`. В конце делает `systemctl restart mihomo`, чтобы новый `mihomo-build-config` подхватился сразу.
 
 Режим можно форсировать переменной `MIHOMO_INSTALL_MODE=fresh|update`.
 
@@ -69,7 +69,7 @@ ssh <host> 'bash /tmp/mihomo-cascade/install.sh && rm -rf /tmp/mihomo-cascade'
 5. Копирует конфигурацию в `/etc/mihomo/`
 6. Скачивает GeoIP базу (`geoip.metadb`)
 7. Устанавливает скрипты сборки конфига и проверки маршрута в `/usr/local/sbin/`
-8. Устанавливает systemd-сервис и cron
+8. Устанавливает systemd-сервис и таймер обновления, снимает прежний `cron.d`, проверяет, что таймер включен и активен (не так - установка падает с ненулевым кодом)
 
 ## Структура
 
@@ -90,8 +90,10 @@ ssh <host> 'bash /tmp/mihomo-cascade/install.sh && rm -rf /tmp/mihomo-cascade'
   mihomo-refresh                   — пересборка + hot reload без рестарта
   mihomo-api                       — чтение Clash API: соединения, группы, задержки
   check-route                      — проверка IP напрямую и через туннель
-/etc/systemd/system/mihomo.service — systemd unit
-/etc/cron.d/mihomo-refresh         — cron: обновление раз в 2 минуты со случайной задержкой
+/etc/systemd/system/
+  mihomo.service                   — сам прокси
+  mihomo-refresh.service           — разовый прогон обновления (Type=oneshot)
+  mihomo-refresh.timer             — расписание: раз в 2 минуты со случайной задержкой
 ```
 
 ## Как это работает
@@ -101,8 +103,10 @@ ssh <host> 'bash /tmp/mihomo-cascade/install.sh && rm -rf /tmp/mihomo-cascade'
   - Скачивает правила по URL из `routing-rules.url`
   - Генерирует `config.yaml` = `config.base.yaml` + узлы статикой (`proxies:`) + группы по алиасам + правила
   - Если IPv6 выключен в ядре сервера, автоматически переключает `tun.auto-route` и `tun.auto-redirect` в `false`, чтобы mihomo не падал на `add rule … address family not supported by protocol`
-- Cron раз в 2 минуты запускает `mihomo-refresh` — пересборка конфига + hot reload через REST API.
-  - Перед запуском строка крона спит случайные 0–59 с (`sleep $(shuf -i 0-59 -n 1 2>/dev/null || echo 0)`). Замер 2026-09-08: агрегатор подписки получал ~900 запросов в час, из них ~346 — шесть машин каскада, бьющих в одну и ту же секунду каждой минуты. Задержка стоит в кроне, а не в скрипте: ручной прогон должен отвечать сразу. Фолбэк `|| echo 0` обязателен — без него отсутствие `shuf` дало бы `sleep` без аргумента, `&&` отменил бы прогон, и нода перестала бы обновляться молча.
+- `mihomo-refresh.timer` раз в 2 минуты запускает `mihomo-refresh` — пересборка конфига + hot reload через REST API.
+  - Расписание задано календарной сеткой (`OnCalendar=*:0/2`) со случайной задержкой `RandomizedDelaySec=59s`. Замер 2026-09-08: агрегатор подписки получал ~900 запросов в час, из них ~346 - шесть машин каскада, бьющих в одну и ту же секунду каждой минуты. Задержка стоит в таймере, а не в скрипте: ручной прогон должен отвечать сразу. `AccuracySec=1s` задан явно - по умолчанию systemd вправе сдвигать запуск в окне до минуты, группируя пробуждения, и эта группировка съела бы джиттер, вернув синхронный залп.
+  - Планировщик - systemd, а не cron, потому что systemd на ноде обязателен и так (`mihomo.service` без него не живет), а cron есть не на всякой машине: на ноде без демона крона файл расписания лежал, читать его было некому, и нода не обновлялась молча (поймано 08.09.2026, конфиг был заморожен месяц). Второго пути мы не поддерживаем - при обновлении установщик снимает `/etc/cron.d/mihomo-refresh` сам.
+  - Наложение прогонов исключено двумя механизмами сразу. systemd не стартует второй экземпляр `mihomo-refresh.service`, пока активен первый, - но только своего юнита. Поэтому `ExecStart` дополнительно берет `flock -n -E 0 /run/mihomo-refresh.lock` (тот же лок, что брал прежний крон): под него попадает старый cron-прогон в окне миграции - иначе он делил бы с таймером `config.yaml.autobak`, `*.new` и `routing-rules.yaml.tmp`. **Ручной `mihomo-refresh` лока не берет**: он стоит в `ExecStart` юнита, а не внутри скрипта, поэтому запуск руками во время разбора идет параллельно таймеру, как и раньше. `-E 0` означает, что занятый лок - штатный пропуск, а не `failed` в journal. Страховка от зависшего прогона - `TimeoutStartSec=300`.
   - Hot reload (`PUT /configs?force=true`) выполняется только если итоговый `config.yaml` побайтово отличается от предыдущего. Если ни подписка, ни правила не изменились — mihomo не дёргаем.
   - Перед подгрузкой конфиг проверяется самим бинарём (`mihomo -t`). Не прошёл — откатываемся на предыдущую копию (`config.yaml.autobak`) и пишем строку в journal, в работе остаётся то, что работало.
   - `PUT` не прошёл — смотрим, жив ли API. **Оборванный ответ при живом API считается применением**: перезагружаясь, mihomo поднимает листенеры заново и рвёт само API-соединение (`curl` видит `Empty reply from server`), а конфиг при этом уже применён. Слепой откат в такой ситуации разводил диск и рантайм, и следующий прогон слал `PUT` снова — reload каждую минуту. API не отвечает — тогда откат: иначе на диске лежала бы версия, которой нет в работе, и следующий прогон, увидев совпадение хэшей, не повторил бы попытку.
@@ -137,13 +141,36 @@ MIHOMO_ALLOW_SHRINK=1 mihomo-refresh
 
 ### Что видно при поломке
 
-Провалы и предупреждения сборщика уходят в journal с тегом `mihomo-refresh` (у крона на нодах нет почты, куда бы падал stderr). `mihomo-refresh` перехватывает вывод `mihomo-build-config` и кладёт его туда же — иначе причина отмены видна только тому, кто запускал руками.
+Провалы и предупреждения сборщика уходят в journal с тегом `mihomo-refresh` (свой вывод юнит пишет туда же, но тег делает записи сборщика отдельно находимыми). `mihomo-refresh` перехватывает вывод `mihomo-build-config` и кладёт его туда же — иначе причина отмены видна только тому, кто запускал руками.
 
 Повтор одинакового текста глушится: сборщик печатает свои замечания на **каждом** прогоне, и без этого одна строка давала бы сотни записей в сутки, топя в себе первое настоящее событие. Пишем при смене текста или раз в `MIHOMO_LOG_REPEAT_SEC` (по умолчанию 1800 с). Обратная сторона: **журнал недосчитывает повторы** — для замера частоты берите снимок состава конфига, а не число строк.
 
 ```bash
-journalctl -t mihomo-refresh --since '24 hours ago'
+journalctl -t mihomo-refresh --since '24 hours ago'   # что сказал сам сборщик
+journalctl -u mihomo-refresh --since '24 hours ago'   # прогоны глазами systemd
 ```
+
+Планировщик проверяется отдельно от прогонов - таймер живет своей жизнью:
+
+```bash
+systemctl status mihomo-refresh.timer   # включен ли, когда следующий запуск
+systemctl list-timers mihomo-refresh.timer
+```
+
+Пустой `list-timers` при установленном каскаде значит, что обновления нет вовсе: до 08.09.2026 такое состояние установщик не замечал и рапортовал успех.
+
+**Откат на cron, если таймер оказался хуже.** Файла расписания в репозитории больше нет, поэтому его нужно достать из истории:
+
+```bash
+systemctl disable --now mihomo-refresh.timer
+rm -f /etc/systemd/system/mihomo-refresh.{service,timer}
+systemctl daemon-reload
+git show 8664bd7:etc/cron.d/mihomo-refresh > /etc/cron.d/mihomo-refresh   # из клона репозитория
+chmod 644 /etc/cron.d/mihomo-refresh
+systemctl is-active cron || systemctl is-active crond                     # без демона откат бесполезен
+```
+
+Две вещи, о которых узнают в неподходящий момент. На машине **без демона крона** откат невозможен в принципе - именно этим она и отличалась (`home-server`). И **после отката нельзя запускать `install.sh`**: он снимет `cron.d` и вернет таймер, то есть откат отменит сам себя при ближайшем обновлении ноды.
 
 ### Узлы инлайнятся в конфиг, а не приезжают провайдером
 
@@ -194,7 +221,9 @@ check-route
 systemctl status mihomo       # статус
 systemctl restart mihomo      # перезапуск
 journalctl -u mihomo -f       # логи
-mihomo-refresh                # ручное обновление подписки
+mihomo-refresh                # ручное обновление подписки (сразу, без задержки таймера)
+systemctl status mihomo-refresh.timer   # планировщик обновления: включен, следующий запуск
+journalctl -u mihomo-refresh -f         # прогоны обновления
 mihomo-api conns              # живые соединения: хост, правило, цепочка, трафик
 mihomo-api conns instagram    # то же с фильтром по подстроке
 mihomo-api groups             # группы и выбранный в каждой узел с задержкой
