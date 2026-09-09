@@ -142,6 +142,37 @@ install_scheduler() {
       return 1
     fi
     echo "  -> снят прежний ${cron_legacy#"$dest"} (его заменил таймер)"
+
+    # systemd-cron может оставить сгенерированный юнит после удаления источника.
+    # Ищем не имя: схема именования принадлежит чужому генератору. Живое
+    # подтверждение с ноды ru 09.09.2026 - там висит юнит
+    # cron-hiddify_daily-root-f878d0e8fcda11f73bdd60de31e7aa74.timer, то есть
+    # с хешем вместо ожидаемого суффикса -0; проверка по имени ответила бы
+    # "чисто" на машине, где юнит остался. SourcePath - свидетельство о
+    # происхождении, а имя нужно только чтобы человек понял, какой юнит остался.
+    #
+    # Один вызов на все юниты, а не show по каждому: перебор 371 юнита на живой
+    # ноде занимает 7,8 с против 0,5 с у пакетного запроса.
+    local cron_source=/etc/cron.d/mihomo-refresh
+    local units_dump leftover_units
+    if ! units_dump="$(systemctl show '*' -p Id -p SourcePath --no-pager 2>/dev/null)"; then
+      # Ошибка перечисления - это незнание, а не подтверждение отсутствия.
+      # Установку не отменяем: таймер работает, но обещать человеку, что
+      # старого планировщика нет, мы не вправе.
+      echo "ПРЕДУПРЕЖДЕНИЕ: не удалось перечислить systemd-юниты после снятия ${cron_source}; наличие сгенерированного юнита неизвестно." >&2
+    else
+      leftover_units="$(printf '%s\n' "${units_dump}" | awk -v src="${cron_source}" '
+        /^Id=/        { id = substr($0, 4); next }
+        /^SourcePath=/ { if (id != "" && substr($0, 12) == src) print id; id = ""; next }
+      ')"
+      if [ -n "${leftover_units}" ]; then
+        while read -r leftover_unit; do
+          [ -n "${leftover_unit}" ] || continue
+          echo "ПРЕДУПРЕЖДЕНИЕ: остался systemd-юнит ${leftover_unit}, порожденный снятым ${cron_source}; на ноде сейчас ДВА планировщика. Юнит автоматически не снимаем." >&2
+        done <<< "${leftover_units}"
+      fi
+    fi
+
   fi
 
   echo "  -> планировщик: systemd timer, ${schedule}${jitter}"
