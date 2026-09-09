@@ -53,16 +53,43 @@ MODE="\$(cat "$MODEF" 2>/dev/null || echo ok)"
 CMD=""
 for a in "\$@"; do case "\$a" in -*) ;; *) CMD="\$a"; break;; esac; done
 case "\$CMD" in
+  list-units)
+    case "\$MODE" in
+      listfail) echo "list-units: stub failure" >&2; exit 1 ;;
+      leftover) echo "cron-mihomo-refresh-root-0.service loaded failed failed" ;;
+      foreign) echo "cron-hiddify_reinstall_on_reboot-root-0.service loaded failed failed" ;;
+    esac
+    exit 0 ;;
+  show)
+    # Пакетный запрос происхождения: systemctl show '*' -p Id -p SourcePath.
+    # Имя оставшегося юнита намеренно взято НЕ по схеме '-0': на живой ноде
+    # генератор дает суффикс-хеш, и тест обязан ловить именно происхождение.
+    if [[ "\$*" == *"-p Id"* && "\$*" == *SourcePath* ]]; then
+      case "\$MODE" in
+        listfail) echo "show: stub failure" >&2; exit 1 ;;
+        leftover)
+          printf 'Id=%s\nSourcePath=%s\n\n' "cron-mihomo-refresh-root-f878d0e8fcda11f73bdd60de31e7aa74.timer" "/etc/cron.d/mihomo-refresh" ;;
+        foreign)
+          printf 'Id=%s\nSourcePath=%s\n\n' "cron-hiddify_reinstall_on_reboot-root-0.service" "/etc/cron.d/hiddify_reinstall_on_reboot" ;;
+      esac
+      printf 'Id=%s\nSourcePath=\n\n' "mihomo.service"
+      exit 0
+    fi
+    if [[ "\$MODE" == leftover ]]; then
+      echo '/etc/cron.d/mihomo-refresh'
+    elif [[ "\$MODE" == foreign ]]; then
+      echo '/etc/cron.d/hiddify_reinstall_on_reboot'
+    else
+      if [[ "\$MODE" == notenabled ]]; then echo "UnitFileState=disabled"; else echo "UnitFileState=enabled"; fi
+      if [[ "\$MODE" == notactive ]];  then echo "ActiveState=inactive";   else echo "ActiveState=active";   fi
+    fi
+    exit 0 ;;
   is-enabled)
     if [[ "\$MODE" == notenabled ]]; then echo disabled; exit 1; fi
     echo enabled; exit 0 ;;
   is-active)
     if [[ "\$MODE" == notactive ]]; then echo inactive; exit 3; fi
     echo active; exit 0 ;;
-  show)
-    if [[ "\$MODE" == notenabled ]]; then echo "UnitFileState=disabled"; else echo "UnitFileState=enabled"; fi
-    if [[ "\$MODE" == notactive ]];  then echo "ActiveState=inactive";   else echo "ActiveState=active";   fi
-    exit 0 ;;
   enable|start|restart)
     if [[ "\$MODE" == enablefail ]]; then echo "Failed to enable unit: stub" >&2; exit 1; fi
     exit 0 ;;
@@ -132,6 +159,8 @@ invoke() { # [$1 = nosystemctl] ; печатает код возврата, вы
 unit() { cat "$1" 2>/dev/null | tr -d ' \t'; }   # сравнение без оглядки на пробелы
 
 REAL_CRON_BEFORE=$([[ -e /etc/cron.d/mihomo-refresh ]] && echo есть || echo нет)
+REAL_TIMER_BEFORE=$([[ -e /etc/systemd/system/mihomo-refresh.timer ]] && echo есть || echo нет)
+REAL_SERVICE_BEFORE=$([[ -e /etc/systemd/system/mihomo-refresh.service ]] && echo есть || echo нет)
 
 echo "A. FR-CASC-TIMER-01: юниты установлены, таймер включен и запущен"
 reset ok; RC=$(invoke)
@@ -197,6 +226,39 @@ check "таймер поставлен" "$([[ -f "$UNITS/mihomo-refresh.timer" ]
 check "остался ровно один планировщик - таймер" \
   "cron=$([[ -e "$CRON" ]] && echo есть || echo нет),timer=$([[ -f "$UNITS/mihomo-refresh.timer" ]] && echo есть || echo нет)" \
   "cron=нет,timer=есть"
+check "проверка происхождения вызвана" "$(grepq 'show .*-p Id.*SourcePath' "$LOG")" "да"
+check "для чистой ноды предупреждения нет" "$(grepq '(ДВА планировщика|неизвестно)' "$OUT")" "нет"
+
+echo "E1. снятый cron.d оставил сгенерированный юнит: предупреждение, но установка успешна"
+reset leftover
+mkdir -p "$SB/root/etc/cron.d"
+printf '*/2 * * * * root /usr/local/sbin/mihomo-refresh\n' > "$CRON"
+RC=$(invoke)
+check "код возврата остается успешным" "$RC" "0"
+# Имя в заглушке намеренно с суффиксом-хешем, как у живого генератора на ноде ru,
+# а не по схеме '-0': тест обязан ловить происхождение, а не угаданное имя.
+check "назван оставшийся юнит" "$(grepq 'cron-mihomo-refresh-root-f878d0e8fcda11f73bdd60de31e7aa74\.timer' "$OUT")" "да"
+check "прямо сказано про два планировщика" "$(grepq 'ДВА планировщика' "$OUT")" "да"
+check "проверено происхождение, а не только имя" "$(grepq 'show .*-p Id.*SourcePath' "$LOG")" "да"
+check "оставшийся юнит не снимается установщиком" "$(grepq '(stop|disable).*cron-mihomo-refresh-root-0\.service' "$LOG")" "нет"
+
+echo "E2. похожее имя с чужим SourcePath не считается оставшимся нашим юнитом"
+reset foreign
+mkdir -p "$SB/root/etc/cron.d"
+printf '*/2 * * * * root /usr/local/sbin/mihomo-refresh\n' > "$CRON"
+RC=$(invoke)
+check "код возврата" "$RC" "0"
+check "перечисление юнитов действительно выполнено" "$(grepq 'show .*-p Id.*SourcePath' "$LOG")" "да"
+check "чужой юнит не назван нашим предупреждением" "$(grepq '(ДВА планировщика|неизвестно)' "$OUT")" "нет"
+
+echo "E3. недоступное перечисление названо незнанием"
+reset listfail
+mkdir -p "$SB/root/etc/cron.d"
+printf '*/2 * * * * root /usr/local/sbin/mihomo-refresh\n' > "$CRON"
+RC=$(invoke)
+check "код возврата остается успешным" "$RC" "0"
+check "перечисление вызвано" "$(grepq 'show .*-p Id.*SourcePath' "$LOG")" "да"
+check "сказано, что наличие неизвестно" "$(grepq '(не удалось перечислить|неизвестно)' "$OUT")" "да"
 
 echo "F. FR-CASC-TIMER-03: таймер не активен - провал с причиной, без рапорта об успехе"
 reset notactive; RC=$(invoke)
@@ -346,7 +408,8 @@ echo "J. песочница: боевая файловая система не �
 check "боевой /etc/cron.d/mihomo-refresh на месте" \
   "$([[ -e /etc/cron.d/mihomo-refresh ]] && echo есть || echo нет)" "$REAL_CRON_BEFORE"
 check "боевых юнитов не появилось" \
-  "$([[ -e /etc/systemd/system/mihomo-refresh.timer || -e /etc/systemd/system/mihomo-refresh.service ]] && echo да || echo нет)" "нет"
+  "timer=$([[ -e /etc/systemd/system/mihomo-refresh.timer ]] && echo есть || echo нет),service=$([[ -e /etc/systemd/system/mihomo-refresh.service ]] && echo есть || echo нет)" \
+  "timer=$REAL_TIMER_BEFORE,service=$REAL_SERVICE_BEFORE"
 
 echo
 [[ $FAILED -eq 0 ]] && echo "ВСЕ СЦЕНАРИИ ПРОШЛИ" || echo "ЕСТЬ ПРОВАЛЫ"
