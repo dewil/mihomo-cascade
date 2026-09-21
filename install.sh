@@ -3,6 +3,56 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
+# Как и scheduler, эти шаги используют SOURCE_DIR и DESTDIR до проверки root
+# и скачиваний. Явные проверки нужны и при вызове функции через `|| exit $?`.
+install_scripts() {
+  local dest="${DESTDIR:-}"
+  local src="${SOURCE_DIR:-$SCRIPT_DIR}"
+  local scripts_dir="${dest}/usr/local/sbin"
+  if [ ! -d "$scripts_dir" ]; then
+    if ! install -d -m 755 "$scripts_dir"; then
+      echo "ОШИБКА: не удалось создать каталог скриптов ${scripts_dir}." >&2
+      return 1
+    fi
+  fi
+  local script
+  for script in mihomo-build-config mihomo-refresh check-route mihomo-api; do
+    if ! install -m 755 "${src}/usr/local/sbin/${script}" "${scripts_dir}/${script}"; then
+      echo "ОШИБКА: не удалось установить скрипт ${script}." >&2
+      return 1
+    fi
+  done
+  echo "  -> скрипты установлены в ${scripts_dir}/"
+}
+
+install_state() {
+  local dest="${DESTDIR:-}"
+  local src="${SOURCE_DIR:-$SCRIPT_DIR}"
+  local state_dir="${dest}/var/lib/mihomo"
+  local units_dir="${dest}/etc/systemd/system"
+  # Владельца mihomo назначит systemd через StateDirectory перед ExecStartPre.
+  # В песочнице системный пользователь не нужен, службу здесь не запускаем.
+  if ! install -d -m 750 "$state_dir"; then
+    echo "ОШИБКА: не удалось создать каталог состояния ${state_dir}." >&2
+    return 1
+  fi
+  if ! install -d -m 755 "$units_dir"; then
+    echo "ОШИБКА: не удалось создать каталог юнитов ${units_dir}." >&2
+    return 1
+  fi
+  if ! install -m 644 "${src}/etc/systemd/system/mihomo.service" "${units_dir}/mihomo.service"; then
+    echo "ОШИБКА: не удалось установить mihomo.service." >&2
+    return 1
+  fi
+  if [ -z "$dest" ]; then
+    if ! systemctl daemon-reload; then
+      echo "ОШИБКА: systemctl daemon-reload не отработал после установки mihomo.service." >&2
+      return 1
+    fi
+  fi
+  echo "  -> каталог состояния ${state_dir} и mihomo.service установлены"
+}
+
 # Шаг планировщика обновления: пара systemd-юнитов вместо прежнего /etc/cron.d.
 #
 # Почему функция и почему в самом начале файла. Шаг обязан быть проверяемым без
@@ -180,8 +230,10 @@ install_scheduler() {
 
 if [ "${1:-}" = "--step" ]; then
   case "${2:-}" in
+    scripts) install_scripts || exit $?; exit 0 ;;
+    state) install_state || exit $?; exit 0 ;;
     scheduler) install_scheduler || exit $?; exit 0 ;;
-    *) echo "Неизвестный шаг: ${2:-<пусто>} (известен: scheduler)" >&2; exit 1 ;;
+    *) echo "Неизвестный шаг: ${2:-<пусто>} (известны: scripts, state, scheduler)" >&2; exit 1 ;;
   esac
 fi
 
@@ -370,11 +422,7 @@ else
 fi
 
 echo "=== 5. Устанавливаем скрипты ==="
-install -m 755 "${SOURCE_DIR}/usr/local/sbin/mihomo-build-config" /usr/local/sbin/mihomo-build-config
-install -m 755 "${SOURCE_DIR}/usr/local/sbin/mihomo-refresh"      /usr/local/sbin/mihomo-refresh
-install -m 755 "${SOURCE_DIR}/usr/local/sbin/check-route"       /usr/local/sbin/check-route
-install -m 755 "${SOURCE_DIR}/usr/local/sbin/mihomo-api"        /usr/local/sbin/mihomo-api
-echo "  -> скрипты установлены в /usr/local/sbin/"
+install_scripts
 
 if [ "$MODE" = "fresh" ]; then
   echo "=== 6. Запрашиваем ссылки у пользователя ==="
@@ -399,9 +447,7 @@ else
 fi
 
 echo "=== 7. Устанавливаем systemd-сервис ==="
-install -m 644 "${SOURCE_DIR}/etc/systemd/system/mihomo.service" /etc/systemd/system/mihomo.service
-systemctl daemon-reload
-echo "  -> mihomo.service установлен"
+install_state
 
 echo "=== 8. Устанавливаем планировщик обновления ==="
 # Ошибка шага роняет установку (set -e): нода без планировщика не обновляется,
