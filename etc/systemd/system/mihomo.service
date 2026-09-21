@@ -9,6 +9,16 @@ Type=simple
 User=mihomo
 Group=mihomo
 WorkingDirectory=/etc/mihomo
+StateDirectory=mihomo
+StateDirectoryMode=0750
+# -d задает также поиск geoip.metadb, поэтому рабочий каталог не переносим.
+# Кэш живет в состоянии; root перед запуском связывает его с прежним путем,
+# не меняя владельца и права /etc/mihomo. Старый обычный cache.db заменяется:
+# потеря сохраненного выбора/fake-ip допустима, двух независимых кэшей нет.
+# -T не позволяет принять каталог или ссылку на каталог за каталог назначения.
+# Путь к ln абсолютный не по выбору: systemd не ищет ExecStartPre по PATH.
+# На всех нодах парка это /usr/bin/ln (проверено 22.09.2026, ru/ru2/ru3).
+ExecStartPre=+/usr/bin/ln -sfnT /var/lib/mihomo/cache.db /etc/mihomo/cache.db
 ExecStartPre=+/usr/local/sbin/mihomo-build-config
 ExecStart=/usr/local/bin/mihomo -d /etc/mihomo
 # always, а не on-failure: при ЧИСТОМ выходе (SIGTERM от чужого скрипта, ручной
