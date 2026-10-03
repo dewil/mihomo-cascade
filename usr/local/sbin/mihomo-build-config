@@ -235,7 +235,11 @@ def _read_routing_rules_url() -> str | None:
         if not s or s.startswith("#"):
             continue
         lines.append(s)
-    return lines[0] if lines else None
+    url = lines[0] if lines else None
+    if url and urlparse(url).hostname == "subscribe_domain":
+        print("Незаполненная настройка routing-rules.url: задайте настоящий URL правил.", file=sys.stderr)
+        sys.exit(1)
+    return url
 
 
 def _download_routing_rules(url: str) -> bool:
@@ -259,15 +263,15 @@ def _download_routing_rules(url: str) -> bool:
                 url,
             ],
             check=True,
+            stderr=subprocess.DEVNULL,
         )
-    except subprocess.CalledProcessError as e:
-        print(f"Не удалось скачать правила с {url!r}: {e}", file=sys.stderr)
+    except subprocess.CalledProcessError:
+        print("Предупреждение: не удалось скачать правила; проверяю прежний файл.", file=sys.stderr)
         tmp.unlink(missing_ok=True)
         return False
-    text = tmp.read_text(encoding="utf-8", errors="replace")
-    if "rules:" not in text:
+    if not _real_routing_rules(_parse_rules_file(tmp)):
         print(
-            "Ответ по routing-rules.url не содержит 'rules:', откат к прежнему файлу.",
+            "Предупреждение: скачанный ответ не содержит настоящих правил; проверяю прежний файл.",
             file=sys.stderr,
         )
         tmp.unlink(missing_ok=True)
@@ -513,7 +517,7 @@ def _parse_rules_file(path: pathlib.Path) -> List[str]:
         return []
     rules: List[str] = []
     in_rules = False
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         s = line.strip()
         if s.startswith("rules:"):
             in_rules = True
@@ -522,16 +526,36 @@ def _parse_rules_file(path: pathlib.Path) -> List[str]:
             continue
         if s.startswith("- "):
             r = s[2:].strip()
-            if (r.startswith('"') and r.endswith('"')) or (r.startswith("'") and r.endswith("'")):
-                r = r[1:-1]
-            rules.append(r)
+            # Комментарий после quoted scalar не является частью правила.
+            # Внутри кавычек сохраняем # и regex; общий split('#') их повреждает.
+            quoted = re.fullmatch(r"""("(?:\\.|[^"\\])*"|'(?:''|[^'])*')(?:\s+#.*)?""", r)
+            if quoted:
+                scalar = quoted.group(1)
+                r = scalar[1:-1]
+            elif not r.startswith(('"', "'")):
+                r = re.split(r"\s+#", r, maxsplit=1)[0].rstrip()
+            if r:
+                rules.append(r)
     return rules
+
+
+def _real_routing_rules(rules: List[str]) -> bool:
+    """Отсекаем отсутствие настройки и поставляемый пример, а не DIRECT вообще."""
+    normalized = sorted(re.sub(r"\s*,\s*", ",", rule.strip()) for rule in rules)
+    example = sorted([
+        "DOMAIN-SUFFIX,whatismyipaddress.com,de",
+        "IP-CIDR,10.0.0.0/8,DIRECT",
+        "GEOIP,RU,DIRECT",
+        "MATCH,DIRECT",
+    ])
+    return bool(normalized) and normalized != ["MATCH,DIRECT"] and normalized != example
 
 
 def _load_routing_rules() -> List[str]:
     rules = _parse_rules_file(ROUTING_RULES)
-    if not rules:
-        rules = ["MATCH,DIRECT"]
+    if not _real_routing_rules(rules):
+        print("Нет настоящих routing-rules.yaml: задайте правила маршрутизации вместо примера.", file=sys.stderr)
+        sys.exit(1)
     return rules
 
 
@@ -711,15 +735,17 @@ def _strip_orphan_listeners(base_text: str, groups: Set[str]) -> str:
 
 
 def main() -> int:
-    url = _read_subscription_url()
-    raw = _download_subscription(url)
     rules_url = _read_routing_rules_url()
     if rules_url:
         if not _download_routing_rules(rules_url):
             print(
-                "Используется существующий /etc/mihomo/routing-rules.yaml (если есть).",
+                "Прежние правила используются только при наличии настоящей настройки.",
                 file=sys.stderr,
             )
+    rules = _load_routing_rules()
+    rules = _load_local_rules() + rules
+    url = _read_subscription_url()
+    raw = _download_subscription(url)
     proxies = _decode_subscription_proxies(raw)
     if not proxies:
         print(
@@ -739,7 +765,6 @@ def main() -> int:
     aliases = _build_alias_regexes(codes)
     _emit_aliases_yaml(aliases)
     assigned = _assign_aliases(proxy_names, aliases)
-    rules = _load_local_rules() + _load_routing_rules()
     gen, groups = _build_generated(proxies, assigned, rules, aliases)
 
     base = _strip_orphan_listeners(BASE_CFG.read_text(encoding="utf-8"), groups)
