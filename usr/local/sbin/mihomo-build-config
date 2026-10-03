@@ -517,13 +517,20 @@ def _parse_rules_file(path: pathlib.Path) -> List[str]:
         return []
     rules: List[str] = []
     in_rules = False
+    rules_indent = 0
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         s = line.strip()
-        if s.startswith("rules:"):
-            in_rules = True
+        if not s or s.startswith("#"):
             continue
+        indent = len(line) - len(line.lstrip())
         if not in_rules:
+            if s.startswith("rules:"):
+                in_rules = True
+                rules_indent = indent
             continue
+        # YAML допускает список без отступа; соседний ключ завершает rules.
+        if indent <= rules_indent and not s.startswith("- "):
+            break
         if s.startswith("- "):
             r = s[2:].strip()
             # Комментарий после quoted scalar не является частью правила.

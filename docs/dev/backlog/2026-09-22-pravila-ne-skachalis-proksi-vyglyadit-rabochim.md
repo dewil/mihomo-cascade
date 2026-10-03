@@ -73,3 +73,5 @@ rules:
 ID: CASC-RULES-REQUIRED. Статус: в работе, независимые тесты по спеке. Спека: ../2026-10-04-spec-casc-rules-required.md. Worktree /data/git/wt/mihomo-rules-required, branch fix/rules-required, база 405e9df. Выбран явный отказ при отсутствии настоящих правил, сохранение настоящего локального файла при временном сбое. Боевые машины не меняются. Следующий этап: зафиксировать RED, затем реализация, полный тестовый прогон и независимая сверка другой моделью.
 
 Независимые RED-тесты: commit 3adda17, 11 методов / 37 содержательных failures; собственный повтор подтверждён. Спека READY gpt-6-sol medium (rules_review). Реализация передана rules_implement, другая роль в том же выделенном worktree, тесты не изменяет.
+
+Реализация 5c7e2d9: 11 Python GREEN; fresh-install, scheduler-install, stub-policy GREEN; bash-n/py_compile/diff-check/gitleaks GREEN. Сверка rules_review gpt-6-sol medium нашла обход через посторонний YAML-раздел после rules. Независимый RED bb1caf1: 13 методов / 3 failures; правка передана той же роли rules_implement. PR https://github.com/dewil/mihomo-cascade/pull/7 пока draft. Боевой rollout не проводился.
