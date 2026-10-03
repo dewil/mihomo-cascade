@@ -227,6 +227,30 @@ else:
                 before = self.snapshot()
                 self.reject(self.build(MIHOMO_ALLOW_SHRINK='1'), before)
 
+    def test_01_example_with_unrelated_top_level_list_is_rejected(self):
+        # A list belonging to another YAML section is not a routing rule.
+        content = EXAMPLE + '\nproxy-groups:\n  - name: extra\n'
+        for existing in (False, True):
+            with self.subTest(existing=existing):
+                self.setUp()
+                if existing:
+                    self.rules(REAL)
+                    self.success(self.build())
+                self.rules(content)
+                before = self.snapshot()
+                self.reject(self.build(), before)
+
+    def test_05_example_download_with_unrelated_top_level_list_preserves_real_rules(self):
+        self.rules(REAL)
+        self.url()
+        self.response.write_text(EXAMPLE + '\nproxy-groups:\n  - name: extra\n')
+        result = self.build()
+        self.assertEqual((self.base / 'routing-rules.yaml').read_text(), REAL,
+                         'unrelated YAML list made the example replace real routing rules')
+        self.success(result)
+        self.assertRegex(result.stdout + result.stderr, r'(?i)(предупрежден|warn)')
+        self.assertNotIn('SYNTHETIC_URL_MARKER', result.stdout + result.stderr)
+
     def test_08_service_requires_builder_success(self):
         unit = (ROOT / 'etc/systemd/system/mihomo.service').read_text()
         commands = re.findall(r'^ExecStartPre=(.*)$', unit, re.MULTILINE)
