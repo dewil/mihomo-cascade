@@ -1,6 +1,6 @@
 # CASC-RULES-REQUIRED: не запускать каскад с примером правил
 
-Статус: реализация завершена 04.10.2026; независимая compliance-сверка READY на 3442865. Боевой rollout и эксплуатационная приёмка отдельно.
+Статус: реализация завершена 04.10.2026; независимая compliance-сверка READY на 3442865. Боевой rollout на шесть установленных машин завершён04.10.2026; детали живой приёмки ниже.
 
 ## Проблема
 
@@ -43,4 +43,21 @@ URL с host subscribe_domain считается незаполненной на�
 
 На 3442865 выполнен весь набор репозитория: 13 Python методов, fresh-install.sh, scheduler-install.sh, stub-policy.sh — GREEN. Bash syntax, Python compile, diff-check и staged gitleaks — GREEN. Новых зависимостей нет. Код устанавливаемого service/installer менять не потребовалось: обязательный ExecStartPre и set-e уже препятствуют успешному запуску при отказе сборщика.
 
-Живой rollout не проводился, ожидаемый/фактический loc не измерен. README содержит процедуру, до её выполнения новая установка не считается принятой в эксплуатацию. PR: https://github.com/dewil/mihomo-cascade/pull/7.
+Код PR: https://github.com/dewil/mihomo-cascade/pull/7. Ночью live rollout не проводился; дневная приёмка описана ниже.
+
+## Живой rollout 04.10.2026
+
+После пользовательской приёмки ru3 dwl поручил раскатать остальные установленные Mihomo. Обновлён только builder: SHA256 `e0b9444f0fef0c629909745c3419d5bfdaa89ad19e8391dde4af202c60efb80e` на ru/ru2/ru3/s79/LLM/home-server(NUC). Чистые Hiddify-выходы не являются целями. Маршруты, Hiddify и systemd units/таймеры/SSH права не менялись.
+
+На каждой машине protected local backup и sandbox с настоящей подпиской, builder и Mihomo validation PASS, negative rules отказ без изменения config/aliases/state. На ru3 дополнительно empty/example. Live замена атомарно под штатным refresh lock; ручной refresh0, config побайтово прежний,12nodes, тот же MainPID Mihomo. Ни install.sh целиком, ни restart не запускались. Полный набор тестов не повторялся — production-код не менялся после проверенного3442865.
+
+| Машина | HTTP через Mihomo | Реально сработавший маршрут | Ожидаемая / фактическая страна |
+|---|---|---|---|
+| ru,ru2,ru3,LLM,NUC | 200 | DomainSuffix chatgpt.com → ee | EE / EE |
+| s79 | 200 | более ранний IPCIDR Cloudflare → de2 | DE / DE |
+
+На s79 первоначальный acceptance runner ошибочно ожидал EE по одному DomainSuffix. API живого соединения подтвердил фактическое IPCIDR/de2 и связь rulePayload с действующим rules list; корректная ожидаемая страна DE. Runner исправлен для остальных проверок, маршруты не переключались. На NUC acceptance-only runner учитывает API connections=null как пустой список; повторный install не делался. API и trace читались без записи raw IP/URL/config/secrets в отчёты.
+
+Backup на ru3 `/root/mihomo-rollout-20261004/`, на остальных `/root/mihomo-fleet-rollout-20261004/` (parent700). Старый builder и конфиги остаются на каждой машине. Rollback builder атомарно под тем же lock; рабочий config этим выпуском не менялся. LLM/NUC выполнены Mac-сессией через существующие root aliases, Cactus независимо проверил установленный hash и systemd metadata. Факты этапов сохраняются в vault `docs/done/2026-10-04-mihomo-fleet-rollout.md`.
+
+Автоматический refresh после контрольного checkpoint отдельно подтверждён на всех шести машинах: success/exit0/inactive; timer и Mihomo active. На ru/ru2/s79 дополнительно protected summary проверил прежний config12nodes и builder hash; для LLM/NUC Cactus независимо прочитал systemd metadata через обычный user-доступ после root приёмки Mac. Никаких дополнительных прав не выдавалось.
