@@ -17,11 +17,12 @@ import dev_fault
 class DevAdapterGuards(unittest.TestCase):
     def test_network_failures_do_not_hide_internal_probe_errors(self):
         client=dev.Client.__new__(dev.Client); client.port=12345
-        for code,expected in [(7,('fail','connect_failed')),(28,('fail','timeout')),
+        for code,expected in [(7,('fail','connect_failed')),(28,('fail','timeout')),(97,('fail','connect_failed')),
                               (2,('unknown','probe_error')),(60,('unknown','probe_error'))]:
             with self.subTest(code=code),patch('subprocess.run',return_value=SimpleNamespace(returncode=code,stdout=b'')):
                 result=client.request('primary')
                 self.assertEqual((result['state'],result['reason']),expected)
+                self.assertEqual(result['curl_exit_code'],code)
         unknown=dev.typed('unknown','probe_error'); failed=dev.typed('fail','timeout'); good=dev.typed('pass','ok')
         self.assertEqual(dev.controlled_points([unknown,failed],[good,good]),[unknown,failed])
         self.assertEqual(dev.controlled_points([failed,good],[unknown,unknown]),[unknown,good])

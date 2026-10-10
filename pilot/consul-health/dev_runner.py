@@ -208,7 +208,7 @@ def validate_client_paths(directory, config):
 def controlled_points(points, controls):
     # Internal/configuration failures never become negative target evidence.
     # An unavailable direct control makes a negative endpoint result ambiguous.
-    return [typed('unknown','probe_error') if p['state']=='fail' and c['state']!='pass' else p
+    return [p | typed('unknown','probe_error') if p['state']=='fail' and c['state']!='pass' else p
             for p,c in zip(points,controls)]
 
 
@@ -294,15 +294,18 @@ if os.path.lexists(path): sys.exit(2)
         try:
             p = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                timeout=28 if download else 7)
-            if p.returncode in (7,28): return typed('fail','connect_failed' if p.returncode==7 else 'timeout')
-            if p.returncode: return typed('unknown','probe_error')
+            # CURLE_PROXY(97) covers a refused SOCKS5 upstream connection even
+            # when the local client listener itself accepted curl's connection.
+            diagnostic={'curl_exit_code':p.returncode}
+            if p.returncode in (7,28,97): return typed('fail','timeout' if p.returncode==28 else 'connect_failed') | diagnostic
+            if p.returncode: return typed('unknown','probe_error') | diagnostic
             body, status = p.stdout.rsplit(b'\n',1); code=int(status)
             good = (code > 0 if head else
                     (code == 204 and not body) if endpoint == 'primary' else
                     (code == 200 and len(body)==1048576) if download else
                     (code == 200 and b'ip=' in body))
-            return typed('pass','ok') if good else typed('fail','http_status' if code != 200 else 'body_mismatch')
-        except Exception: return typed('unknown','probe_error')
+            return (typed('pass','ok') if good else typed('fail','http_status' if code != 200 else 'body_mismatch')) | diagnostic
+        except Exception: return typed('unknown','probe_error') | {'curl_exit_code':None}
 
 
 class Accounting:
@@ -335,6 +338,30 @@ def accounting_window(client, accounting):
     return False
 
 
+
+
+BASELINE_CELLS={('llm','de4','transport'),('llm','de4','application'),('llm','de4','accounting'),
+                ('ru','de4','transport'),('ru2','de4','transport')}
+
+def baseline_ready(sample):
+    """Direct results and Consul evidence must both support the same baseline.
+
+    Additional remote application/accounting cells intentionally stay unknown.
+    Missing or duplicate required cells never establish a healthy baseline.
+    """
+    try:
+        if sample['application']['state']!='pass' or sample['accounting']['state']!='pass': return False
+        if set(sample['transport'])!=set(OBSERVERS) or any(row['state']!='pass' for row in sample['transport'].values()): return False
+        evaluation=sample['evaluation']
+        if evaluation['control_plane']!='ok': return False
+        seen=set()
+        for cell in evaluation['cells']:
+            key=(cell['observer'],cell['target'],cell['check'])
+            if key in BASELINE_CELLS:
+                if key in seen or cell['state']!='pass': return False
+                seen.add(key)
+        return seen==BASELINE_CELLS
+    except (KeyError,TypeError,AttributeError): return False
 
 def process_resources(pid):
     try:
@@ -421,6 +448,7 @@ def run_dev(*, consul_binary, runtime_dir, output_dir, target_host, dev_node_id,
         return {'at_ms':measured,'started_at_ms':tick,'actual_cycle_period_ms':None if len(cycle_starts)<2 else tick-cycle_starts[-2],'cycle_duration_ms':now_ms()-tick,'transport':trans,'application':application,
                 'accounting':accounting,'local_services':service,'baseline_comparator':baseline,'control_points':controls,
                 'application_points':points,'evaluation':assessed,
+                'observer_heartbeats':{o['id']:o['last_seen_ms'] for o in snapshot['observers']},
                 'false_path_down':int(baseline['state']!='pass' and application['state']=='pass')}
 
     def row(name):
@@ -432,6 +460,23 @@ def run_dev(*, consul_binary, runtime_dir, output_dir, target_host, dev_node_id,
         r['samples'].append(s); r['false_path_down']+=s['false_path_down']
         if any(c['state']=='unknown' for c in s['evaluation']['cells']):
             r['unknown_duration_ms']+=s['at_ms']-s['started_at_ms']
+
+    def await_baseline(client, record):
+        since=now_ms(); deadline=time.monotonic()+15
+        record['baseline_samples']=[]
+        while time.monotonic()<deadline:
+            fresh=collect(client)
+            record['baseline_samples'].append(fresh)
+            recent_reports=all(type(c.get('observed_at_ms')) is int and c['observed_at_ms']>=since
+                for c in fresh['evaluation']['cells'] if (c['observer'],c['target'],c['check']) in BASELINE_CELLS)
+            recent_heartbeats=all(type(fresh['observer_heartbeats'].get(o)) is int and fresh['observer_heartbeats'][o]>=since for o in OBSERVERS)
+            if time.monotonic()<=deadline and baseline_ready(fresh) and recent_reports and recent_heartbeats:
+                record['baseline_sample']=fresh
+                record['baseline_at_ms']=fresh['at_ms']
+                return fresh
+            remaining=deadline-time.monotonic()
+            if remaining>0: time.sleep(min(1,remaining))
+        return None
 
     def recovered(client):
         state=service_state()
@@ -452,8 +497,9 @@ def run_dev(*, consul_binary, runtime_dir, output_dir, target_host, dev_node_id,
             baseline['baseline_at_ms']=now_ms()
             advanced=accounting_window(client,account)
             baseline['accounting_baseline']=advanced if advanced else None
-            fresh=collect(client); add(baseline,fresh)
-            healthy=bool(advanced) and fresh['application']['state']=='pass' and all(v['state']=='pass' for v in fresh['transport'].values())
+            fresh=await_baseline(client,baseline) if advanced else None
+            if fresh: add(baseline,fresh)
+            healthy=bool(advanced) and fresh is not None
             baseline['passed']=healthy
             if not healthy: raise ValueError('DEV_BASELINE_FAILED')
             if allow_dev_faults:
@@ -464,7 +510,7 @@ def run_dev(*, consul_binary, runtime_dir, output_dir, target_host, dev_node_id,
                     if not advanced: raise ValueError('DEV_ACCOUNTING_BASELINE')
                     r=row(name); scenarios.append(r)
                     r['accounting_baseline']=advanced
-                    r['baseline_at_ms']=now_ms()
+                    if await_baseline(client,r) is None: raise ValueError('DEV_BASELINE_FAILED')
                     pidfd=None; suspended=False
                     try:
                         if name in ('service_down','worker_hang'):
@@ -482,7 +528,7 @@ def run_dev(*, consul_binary, runtime_dir, output_dir, target_host, dev_node_id,
                             backend.suspend_observer('llm'); suspended=True; r['injected_at_ms']=now_ms()
                         else:
                             backend.suspend_server(); suspended=True; r['injected_at_ms']=now_ms()
-                        duration=170 if name=='worker_hang' else 15
+                        duration=170 if name=='worker_hang' else 25 if name=='observer_lost' else 15
                         deadline=time.monotonic()+duration
                         while time.monotonic()<deadline:
                             tick=time.monotonic()

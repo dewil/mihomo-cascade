@@ -34,6 +34,12 @@ class DevNetworkResultContract(unittest.TestCase):
     def test_curl_connection_failure_is_a_failed_measurement(self):
         self.assert_result(self.request_result('primary', code=7), 'fail', 'connect_failed')
 
+    def test_curl_socks_upstream_failure_is_a_failed_measurement(self):
+        # SOCKS can wrap refused upstream connections as curl exit 97.
+        # Independent RED observed before the fix: state unknown, expected fail;
+        # the other 10 network-result regressions remained green.
+        self.assert_result(self.request_result('primary', code=97), 'fail', 'connect_failed')
+
     def test_curl_timeout_is_a_failed_measurement(self):
         self.assert_result(self.request_result('primary', code=28), 'fail', 'timeout')
 
