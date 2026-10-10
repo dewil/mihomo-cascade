@@ -1,6 +1,6 @@
 ---
 id: LLM-LOCAL-FALLBACK
-status: accepted
+status: done
 created: 2026-10-10
 ---
 
@@ -23,4 +23,14 @@ created: 2026-10-10
 
 ## Источники и границы
 
-Repo mihomo-cascade; currentbase dcf562f8. HostJSON — локальная операторская настройка, не новый канал артефактов для парка. install.sh ее не удаляет; общуюlocal-rules после hostreinstall не считать резервнойкопией LLMoverrides, настройкиLLM сохранятьвprivatebackup/документированномdeployment. Workowner vault docs/backlog/2026-10-10-llm-local-openai-fallback.md. Rollout других5машин не нужен дляoptionalfeature, пока унихнетlocalfile.
+Repo mihomo-cascade; currentbase dcf562f8. HostJSON — локальная операторская настройка, не новый канал артефактов для парка. install.sh ее не удаляет; общуюlocal-rules после hostreinstall не считать резервнойкопией LLMoverrides, настройкиLLM сохранятьвprivatebackup/документированномdeployment. Workowner vault docs/done/2026-10-10-llm-local-openai-fallback.md. Rollout других5машин не нужен дляoptionalfeature, пока унихнетlocalfile.
+
+## Приемка и установка завершены
+
+Независимый blind1269149:8 методов/22 содержательных RED до реализации,0 fixture errors. Реализация95d14f9 (actual gpt-6-astra/medium): builder+README. Root независимо выполнил все27 методов(local8/cascade6/rules-required13) и3 shell suites — GREEN. Unknown ordinary orphan, node-floor, required rules сохранены. Функциональные файлы после этого не менялись.
+
+Haiku5.5 actual OpenRouter/Claude Platform on AWS: GREEN, response gen-1791665747-kD8z4W8SvDce89437QcK; проверены runtime и bounded rollout helper af0883c6579eb15b3c9de70a6be0043a7fecc8a0832eff9bd59032aa9ea23ad1. Первичные ложные замечания о probe/reserve disjointness и Python finally закрыты фактической сверкой без изменения кода.
+
+LLM installation: candidate SHA89efa46b9e6529c52200950786e43ec22d4fef2ff9cfaa74509d05d914175418; strictJSONee:[de,pl],20 локальных правил направлены в ee-failover. Dry-run/apply exit0, privatebackup /root/llm-openai-fallback-20261010-235701-wpwyttsn. Обычный production mixed7890 достигает OpenAI API HTTP401; API подтверждает ранниеOpenAI/ChatGPT→ee-failover, физическиеDE,PL, selectedDE. EE физическиREJECT до восстановления ДЦ. Global artifact/другие5машин не изменялись.
+
+Живая изолированная копия actualLLM runtime group (immutableconfig, loopbackrelays,безprod fault): DE→PL30.1с, возвратDE29.1с, all-down29.1с блокируетpayloadбезDIRECT. CFcountryDE/PL/DE, OpenAI401 во всех доступных фазах; reload0/forced-delay0. Лог /tmp/llm-local-live-proof.log. LiveEEfailback не заявляется: EE недоступна в ДЦ, полный приоритетEE/DE/PL покрыт CLI synthetic subscription tests. Путь LLM — обычный localproxy, не temporaryReality из другой задачи.
