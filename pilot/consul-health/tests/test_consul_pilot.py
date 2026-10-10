@@ -1,5 +1,6 @@
 """Blind contract tests from accepted CONSUL-2 spec; no implementation imports at collection."""
 import copy
+import hashlib
 import importlib.util
 import itertools
 import json
@@ -226,6 +227,70 @@ class ContractTests(unittest.TestCase):
                             continue
                         self.assertFalse(result.get('acceptance_complete', False))
                         self.assertNotEqual(result.get('outcome'), 'passed')
+
+
+class EventContractTests(unittest.TestCase):
+    def setUp(self):
+        self.module = load_contract(self)
+        self.assertTrue(callable(getattr(self.module, 'export_events', None)),
+                        'Missing public callable: export_events')
+
+    def sample(self, time, state, subject='consul-pilot/a/b/application', **kwargs):
+        sample = dict(subject=subject, measured_at_ms=time, state=state,
+                      reason={'ok': 'ok', 'failing': 'timeout', 'unknown': 'stale'}[state],
+                      evidence_ids=['z', 'a', 'z'])
+        sample.update(kwargs)
+        return sample
+
+    def test_events_unknown_preserves_failure_and_exact_canonical_hash(self):
+        samples = [self.sample(i, state) for i, state in enumerate(
+            ('ok', 'failing', 'unknown', 'unknown', 'ok', 'ok', 'failing'))]
+        before = copy.deepcopy(samples)
+        events = self.module.export_events(samples)
+        self.assertEqual(samples, before)
+        transitions = ['observation', 'problem', 'unknown', 'unknown', 'recovery', 'observation', 'problem']
+        self.assertEqual([e['transition'] for e in events], transitions)
+        for sample, transition, actual in zip(samples, transitions, events):
+            expected = dict(schema_version=1, subject=sample['subject'], measured_at_ms=sample['measured_at_ms'],
+                            state=sample['state'], transition=transition, reason=sample['reason'],
+                            evidence_ids=['a', 'z'], origin='consul-pilot', production_delivery=False)
+            canonical = json.dumps(expected, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
+            expected['event_id'] = hashlib.sha256(canonical.encode('utf-8')).hexdigest()
+            self.assertEqual(actual, expected)
+
+    def test_events_stale_replay_dedup_and_subject_isolation(self):
+        a = self.sample(20, 'failing')
+        duplicate = dict(a, evidence_ids=['a', 'z'])
+        samples = [a, duplicate, self.sample(19, 'ok'),
+                   self.sample(1, 'ok', subject='consul-pilot/c/b/application'),
+                   self.sample(21, 'unknown'), self.sample(22, 'ok')]
+        events = self.module.export_events(samples)
+        self.assertEqual([e['measured_at_ms'] for e in events], [20, 1, 21, 22])
+        self.assertEqual([e['transition'] for e in events], ['problem', 'observation', 'unknown', 'recovery'])
+        self.assertEqual(len({e['event_id'] for e in events}), 4)
+        self.assertEqual(self.module.export_events([]), [])
+
+    def test_events_equal_timestamp_conflicts_fail_closed(self):
+        base = self.sample(1, 'failing')
+        for change in (dict(state='ok', reason='ok'), dict(reason='connect_failed'), dict(evidence_ids=['different'])):
+            with self.subTest(change=change):
+                with self.assertRaisesRegex(ValueError, '^EVENT_CONFLICT$'):
+                    self.module.export_events([base, dict(base, **change)])
+
+    def test_events_schema_rejects_unknown_fields_types_and_contradictions(self):
+        cases = []
+        for key in self.sample(1, 'ok'):
+            sample = self.sample(1, 'ok'); del sample[key]; cases.append(sample)
+        for key, value in [('extra', 'PRIVATE_SENTINEL'), ('subject', 'PRIVATE_SENTINEL'),
+                           ('measured_at_ms', True), ('measured_at_ms', -1), ('measured_at_ms', 1.5),
+                           ('state', 'pass'), ('reason', 'timeout'), ('evidence_ids', 'PRIVATE_SENTINEL'),
+                           ('evidence_ids', [1])]:
+            sample = self.sample(1, 'ok'); sample[key] = value; cases.append(sample)
+        for sample in cases:
+            with self.assertRaises(ValueError) as caught:
+                self.module.export_events([sample])
+            self.assertNotIn('PRIVATE_SENTINEL', str(caught.exception))
+            self.assertRegex(str(caught.exception), r'^[A-Za-z0-9_-]+$')
 
 
 if __name__ == '__main__':

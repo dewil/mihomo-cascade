@@ -45,6 +45,7 @@ class RealConsulTests(unittest.TestCase):
             self.assertEqual(consul['acl_denials']['anonymous_write'], 403)
             self.assertEqual(consul['acl_denials']['evaluator_write'], 403)
             scenarios = evidence['scenarios']
+            self.assertIsInstance(evidence['events'], list)
             for name in ('control_point_only', 'single_path', 'row_fault', 'service_down',
                          'worker_hang', 'observer_lost', 'partition', 'control_plane_unavailable'):
                 rows = [s for s in scenarios if s['id'] == name]
