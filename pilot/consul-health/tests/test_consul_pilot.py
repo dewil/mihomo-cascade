@@ -277,6 +277,13 @@ class EventContractTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, '^EVENT_CONFLICT$'):
                     self.module.export_events([base, dict(base, **change)])
 
+    def test_events_older_conflicting_delivery_ignored_before_conflict_check(self):
+        samples = [self.sample(1, 'ok'), self.sample(3, 'failing'),
+                   self.sample(1, 'failing', reason='connect_failed'), self.sample(4, 'ok')]
+        events = self.module.export_events(samples)
+        self.assertEqual([e['measured_at_ms'] for e in events], [1, 3, 4])
+        self.assertEqual([e['transition'] for e in events], ['observation', 'problem', 'recovery'])
+
     def test_events_schema_rejects_unknown_fields_types_and_contradictions(self):
         cases = []
         for key in self.sample(1, 'ok'):
