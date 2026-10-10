@@ -644,11 +644,60 @@ def _check_orphan_policies(orphans: List[str]) -> None:
     )
 
 
+def _cascade_metadata(aliases: Dict[str, str], proxy_names: List[str]):
+    """Strict inline JSON metadata, delivered atomically with the rules."""
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate metadata key")
+            result[key] = value
+        return result
+
+    data = {}
+    try:
+        for line in ROUTING_RULES.read_text(encoding="utf-8").splitlines():
+            for key in ("cascade-fallbacks", "cascade-probes"):
+                if line.startswith(key + ":"):
+                    if key in data:
+                        raise ValueError("duplicate metadata field")
+                    data[key] = json.loads(line.split(":", 1)[1], object_pairs_hook=unique_object)
+        fallbacks = data.get("cascade-fallbacks", {})
+        probes = data.get("cascade-probes", [])
+        if not isinstance(fallbacks, dict) or ("cascade-fallbacks" in data and not fallbacks):
+            raise ValueError("expected nonempty fallback map")
+        if not isinstance(probes, list) or any(not isinstance(x, str) for x in probes) or len(set(probes)) != len(probes):
+            raise ValueError("expected unique probe aliases")
+        mentioned = set(probes)
+        for primary, reserves in fallbacks.items():
+            if not isinstance(reserves, list) or not reserves or any(not isinstance(x, str) for x in reserves):
+                raise ValueError("expected nonempty reserve list")
+            if len(set(reserves)) != len(reserves) or primary in reserves:
+                raise ValueError("duplicate or self reserve")
+            if primary + "-failover" in aliases:
+                raise ValueError("derived policy collision")
+            mentioned.update([primary, *reserves])
+        for alias in mentioned:
+            if alias not in aliases or alias in BUILTIN_POLICIES:
+                raise ValueError("unknown physical alias")
+            if sum(bool(re.search(aliases[alias], name)) for name in proxy_names) > 1:
+                raise ValueError("ambiguous physical alias")
+        for name in proxy_names:
+            if sum(bool(re.search(aliases[alias], name)) for alias in mentioned) > 1:
+                raise ValueError("proxy matches multiple physical aliases")
+        return fallbacks, set(probes)
+    except (ValueError, TypeError) as error:
+        print("Invalid cascade metadata: " + str(error), file=sys.stderr)
+        raise SystemExit(3)
+
+
 def _build_generated(
     proxies: List[Dict[str, Any]],
     assigned: Dict[str, str],
     rules: List[str],
     aliases: Dict[str, str],
+    fallbacks=None,
+    probes=None,
 ) -> str:
     """config.yaml = узлы статикой + группы по алиасам + правила.
 
@@ -660,6 +709,8 @@ def _build_generated(
     доставки, разобранные узлы у нас и так на руках - поэтому пишем их прямо в
     конфиг.
     """
+    fallbacks = fallbacks or {}
+    probes = probes or set()
     referenced: Set[str] = set()
     for r in rules:
         pol = _rule_policy(r)
@@ -681,17 +732,34 @@ def _build_generated(
 """
         )
 
+    fallback_groups = set()
+    for primary, reserves in sorted(fallbacks.items()):
+        name = primary + "-failover"
+        members = [assigned[alias] for alias in [primary, *reserves] if alias in assigned]
+        if not members:
+            if name in referenced:
+                _check_orphan_policies([name])
+            members = ["REJECT"]
+        fallback_groups.add(name)
+        blocks_pg.append(
+            f"  - name: {name}\n    type: fallback\n"
+            "    url: https://www.gstatic.com/generate_204\n"
+            "    interval: 30\n    timeout: 5000\n    lazy: false\n    proxies:\n"
+            + "".join("      - " + json.dumps(member, ensure_ascii=False) + "\n" for member in members)
+        )
+
     # Политики, упомянутые в правилах, для которых узла в подписке не нашлось.
     # Алиасы, которых нет в правилах, сюда не попадают и сборку не блокируют:
     # группа fi, на которую никто не ссылается, - не повод останавливать ноду.
     orphans = [
         pol
         for pol in sorted(referenced)
-        if pol not in BUILTIN_POLICIES and pol not in assigned
+        if pol not in BUILTIN_POLICIES and pol not in assigned and pol not in fallback_groups
     ]
-    if orphans:
+    ordinary_orphans = [pol for pol in orphans if pol not in probes]
+    if ordinary_orphans:
         # Может не вернуться: при живом предыдущем конфиге выходит с кодом 3.
-        _check_orphan_policies(orphans)
+        _check_orphan_policies(ordinary_orphans)
     for pol in orphans:
         blocks_pg.append(
             f"""  - name: {pol}
@@ -707,7 +775,7 @@ def _build_generated(
 
     pg = "proxy-groups:\n" + "\n".join(blocks_pg) if blocks_pg else "proxy-groups: []"
     parts = [_dump_clash_proxies(proxies), pg, "\n".join(rules_lines)]
-    groups = set(assigned) | {p for p in referenced if p not in BUILTIN_POLICIES}
+    groups = set(assigned) | fallback_groups | {p for p in referenced if p not in BUILTIN_POLICIES}
     return "\n".join(parts) + "\n", groups
 
 
@@ -772,7 +840,8 @@ def main() -> int:
     aliases = _build_alias_regexes(codes)
     _emit_aliases_yaml(aliases)
     assigned = _assign_aliases(proxy_names, aliases)
-    gen, groups = _build_generated(proxies, assigned, rules, aliases)
+    fallbacks, probes = _cascade_metadata(aliases, proxy_names)
+    gen, groups = _build_generated(proxies, assigned, rules, aliases, fallbacks, probes)
 
     base = _strip_orphan_listeners(BASE_CFG.read_text(encoding="utf-8"), groups)
     base = base.rstrip() + "\n\n"
