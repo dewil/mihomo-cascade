@@ -363,6 +363,19 @@ def baseline_ready(sample):
         return seen==BASELINE_CELLS
     except (KeyError,TypeError,AttributeError): return False
 
+
+def service_down_detected(sample):
+    """REQ06 service/transport evidence; application TLS errors stay unknown."""
+    try:
+        local=sample['local_services']; transport=sample['transport']; controls=sample['control_points']
+        return (local['units_active']['hiddify-haproxy.service'] is False and
+                local['public443_haproxy'] is False and set(transport)==set(OBSERVERS) and
+                all(result['state']=='fail' for result in transport.values()) and
+                sample['application']['state'] in ('fail','unknown') and
+                len(controls)==2 and all(result['state']=='pass' for result in controls))
+    except (KeyError,TypeError,AttributeError): return False
+
+
 def process_resources(pid):
     try:
         stat=Path('/proc/%d/stat'%pid).read_text().rsplit(')',1)[1].split()
@@ -533,7 +546,9 @@ def run_dev(*, consul_binary, runtime_dir, output_dir, target_host, dev_node_id,
                         while time.monotonic()<deadline:
                             tick=time.monotonic()
                             s=collect(client,lost=name=='observer_lost',cp_down=name=='control_plane_unavailable'); add(r,s)
-                            if name in ('service_down','client_path_bad'):
+                            if name=='service_down':
+                                detected=service_down_detected(s)
+                            elif name=='client_path_bad':
                                 detected=s['application']['state']=='fail'
                             elif name=='worker_hang':
                                 detected=(s['accounting']['reason']=='accounting_stale' and s['application']['state']=='pass'
@@ -583,6 +598,7 @@ def run_dev(*, consul_binary, runtime_dir, output_dir, target_host, dev_node_id,
                              'Observer ASN/DC/physical domains unknown; no independent quorum claim.',
                              'Counter delta includes overhead and possible concurrent probe traffic.',
                              'Both comparators share collection cycles with requested minimum period 5s; actual_cycle_period_ms and cycle_duration_ms record overruns. Production HEAD cadence is 30s.',
+                             'Service-down detection requires stopped HAProxy/public443, all three physical transports failing, no application pass and both external controls passing; TLS35 remains application unknown.',
                              'Freshness accounting 150s; worker schedule 60s. Bounded worker log is liveness only; worker detection requires stale liveness AND frozen counter AND live application.',
                              'Real dev evidence does not establish geographic outage, production HA or user-line behavior.'],
               'requirement_evidence':{**{'REQ-CONSUL-%02d'%n:('dev scenarios' if n in (4,5,6,7,8) else 'see laboratory report') for n in range(1,10)},
