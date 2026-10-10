@@ -46,6 +46,7 @@ BASE_CFG = BASE / "config.base.yaml"
 ROUTING_RULES = BASE / "routing-rules.yaml"
 ROUTING_RULES_URL = BASE / "routing-rules.url"
 LOCAL_RULES = BASE / "local-rules.yaml"
+LOCAL_FALLBACKS = BASE / "cascade-fallbacks.local.json"
 ISO_CODES = BASE / "iso3166_alpha2.txt"
 ALIASES_OUT = BASE / "aliases.yaml"
 OUT_CFG = BASE / "config.yaml"
@@ -654,17 +655,8 @@ def _cascade_metadata(aliases: Dict[str, str], proxy_names: List[str]):
             result[key] = value
         return result
 
-    data = {}
-    try:
-        for line in ROUTING_RULES.read_text(encoding="utf-8").splitlines():
-            for key in ("cascade-fallbacks", "cascade-probes"):
-                if line.startswith(key + ":"):
-                    if key in data:
-                        raise ValueError("duplicate metadata field")
-                    data[key] = json.loads(line.split(":", 1)[1], object_pairs_hook=unique_object)
-        fallbacks = data.get("cascade-fallbacks", {})
-        probes = data.get("cascade-probes", [])
-        if not isinstance(fallbacks, dict) or ("cascade-fallbacks" in data and not fallbacks):
+    def validate(fallbacks, probes, *, required=False):
+        if not isinstance(fallbacks, dict) or (required and not fallbacks):
             raise ValueError("expected nonempty fallback map")
         if not isinstance(probes, list) or any(not isinstance(x, str) for x in probes) or len(set(probes)) != len(probes):
             raise ValueError("expected unique probe aliases")
@@ -685,7 +677,29 @@ def _cascade_metadata(aliases: Dict[str, str], proxy_names: List[str]):
         for name in proxy_names:
             if sum(bool(re.search(aliases[alias], name)) for alias in mentioned) > 1:
                 raise ValueError("proxy matches multiple physical aliases")
+
+    data = {}
+    try:
+        for line in ROUTING_RULES.read_text(encoding="utf-8").splitlines():
+            for key in ("cascade-fallbacks", "cascade-probes"):
+                if line.startswith(key + ":"):
+                    if key in data:
+                        raise ValueError("duplicate metadata field")
+                    data[key] = json.loads(line.split(":", 1)[1], object_pairs_hook=unique_object)
+        fallbacks = data.get("cascade-fallbacks", {})
+        probes = data.get("cascade-probes", [])
+        # A local override must never conceal an invalid central chain.
+        validate(fallbacks, probes, required="cascade-fallbacks" in data)
+        # lexists also catches dangling symlinks; only an absent file is optional.
+        if os.path.lexists(LOCAL_FALLBACKS):
+            local = json.loads(LOCAL_FALLBACKS.read_text(encoding="utf-8"), object_pairs_hook=unique_object)
+            validate(local, probes, required=True)
+            fallbacks = {**fallbacks, **local}
+            validate(fallbacks, probes)
         return fallbacks, set(probes)
+    except (OSError, UnicodeError):
+        print("Cannot read cascade metadata", file=sys.stderr)
+        raise SystemExit(3)
     except (ValueError, TypeError) as error:
         print("Invalid cascade metadata: " + str(error), file=sys.stderr)
         raise SystemExit(3)
@@ -838,13 +852,13 @@ def main() -> int:
     proxy_names = [p["name"] for p in proxies]
     codes = _load_iso_codes()
     aliases = _build_alias_regexes(codes)
-    _emit_aliases_yaml(aliases)
     assigned = _assign_aliases(proxy_names, aliases)
     fallbacks, probes = _cascade_metadata(aliases, proxy_names)
     gen, groups = _build_generated(proxies, assigned, rules, aliases, fallbacks, probes)
 
     base = _strip_orphan_listeners(BASE_CFG.read_text(encoding="utf-8"), groups)
     base = base.rstrip() + "\n\n"
+    _emit_aliases_yaml(aliases)
     _write_if_changed(OUT_CFG, base + gen)
     _save_state(len(proxies))
     return 0
