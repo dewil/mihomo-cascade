@@ -376,6 +376,57 @@ def service_down_detected(sample):
     except (KeyError,TypeError,AttributeError): return False
 
 
+
+def summarize_unknown_intervals(samples, *, start_ms, end_ms, relevant_cells):
+    """Pure sample-and-hold estimate over recorded evaluation timestamps.
+
+    Missing cells are unknown, while unobserved time before the first sample is
+    uncovered. Reasons participate in equality only; probe semantics are not
+    reclassified here. Long gaps remain visible and are not continuous proof.
+    """
+    def timestamp(value):
+        if type(value) is not int or value<0: raise ValueError()
+        return value
+    def key(value):
+        if not isinstance(value,(list,tuple)) or len(value)!=3 or any(type(x) is not str or not x for x in value):
+            raise ValueError()
+        return tuple(value)
+    try:
+        start=timestamp(start_ms); end=timestamp(end_ms)
+        if end<start or type(samples) is not list or not samples or type(relevant_cells) is not list: raise ValueError()
+        scope={key(cell) for cell in relevant_cells}
+        full=set(scope); evaluations={}
+        for sample in samples:
+            evaluation=sample['evaluation']; at=timestamp(evaluation['evaluated_at_ms'])
+            if type(evaluation['cells']) is not list: raise ValueError()
+            cells={}
+            for cell in evaluation['cells']:
+                identity=key((cell['observer'],cell['target'],cell['check']))
+                state=cell['state']; reason=cell['reason']
+                if identity in cells or state not in ('pass','fail','unknown') or type(reason) is not str: raise ValueError()
+                cells[identity]=(state,reason)
+            if at in evaluations and evaluations[at]!=cells: raise ValueError()
+            evaluations[at]=cells; full.update(cells)
+        times=sorted(evaluations)
+        if end>times[-1]: raise ValueError()
+        relevant_unknown=0; matrix_unknown=0; max_gap=0
+        for left,right in zip(times,times[1:]):
+            overlap=max(0,min(end,right)-max(start,left))
+            if not overlap: continue
+            max_gap=max(max_gap,right-left)
+            cells=evaluations[left]
+            if any(cells.get(cell,('unknown','missing'))[0]=='unknown' for cell in scope): relevant_unknown+=overlap
+            if any(cells.get(cell,('unknown','missing'))[0]=='unknown' for cell in full): matrix_unknown+=overlap
+        return {'unknown_sample_hold_ms':relevant_unknown,
+                'full_matrix_unknown_sample_hold_ms':matrix_unknown,
+                'uncovered_prefix_ms':max(0,min(end,times[0])-start),
+                'max_evaluation_gap_ms':max_gap,
+                'scope_cells':[list(cell) for cell in sorted(scope)],
+                'excluded_cells':[list(cell) for cell in sorted(full-scope)],
+                'method':'sample-and-hold of recorded evaluation states; clipped window, no extrapolation; gaps are not continuously observed duration'}
+    except (KeyError,TypeError,ValueError,AttributeError):
+        raise ValueError('UNKNOWN_INTERVAL_INVALID') from None
+
 def process_resources(pid):
     try:
         stat=Path('/proc/%d/stat'%pid).read_text().rsplit(')',1)[1].split()
@@ -471,8 +522,6 @@ def run_dev(*, consul_binary, runtime_dir, output_dir, target_host, dev_node_id,
 
     def add(r,s):
         r['samples'].append(s); r['false_path_down']+=s['false_path_down']
-        if any(c['state']=='unknown' for c in s['evaluation']['cells']):
-            r['unknown_duration_ms']+=s['at_ms']-s['started_at_ms']
 
     def await_baseline(client, record):
         since=now_ms(); deadline=time.monotonic()+15
@@ -584,6 +633,20 @@ def run_dev(*, consul_binary, runtime_dir, output_dir, target_host, dev_node_id,
     finally:
         if current_fault: current_fault.close()
         cleanup=backend.stop()
+    # Reporting-only postprocessing; does not perform probes or change verdicts.
+    for scenario in scenarios:
+        timeline=([scenario['baseline_sample']] if 'baseline_sample' in scenario else [])+scenario['samples']
+        if timeline:
+            first=min(sample['evaluation']['evaluated_at_ms'] for sample in timeline)
+            end=max(sample['evaluation']['evaluated_at_ms'] for sample in timeline)
+            start=scenario['injected_at_ms'] if scenario['injected_at_ms'] is not None else first
+        if not timeline or start>end:
+            scenario['unknown_duration_ms']=None
+            scenario['unknown_intervals']={'unavailable_reason':'no_evaluation_window'}
+            continue
+        summary=summarize_unknown_intervals(timeline,start_ms=start,end_ms=end,relevant_cells=list(BASELINE_CELLS))
+        scenario['unknown_duration_ms']=summary['unknown_sample_hold_ms']
+        scenario['unknown_intervals']=summary
     child_usage_after=resource.getrusage(resource.RUSAGE_CHILDREN)
     acceptance=bool(allow_dev_faults and not error and healthy and len(scenarios)==6 and all(r['passed'] for r in scenarios))
     evidence={'schema_version':1,'mode':'dev','source_hashes':source_hashes,'consul':backend.metrics,'scenarios':scenarios,
@@ -595,6 +658,7 @@ def run_dev(*, consul_binary, runtime_dir, output_dir, target_host, dev_node_id,
                 'remote_observers':'self CPU/maxrss in transport results; remote fault/watchdog CPU/maxrss in rollback resources'},'cleanup':cleanup,
               'recommendation':'limit' if acceptance else 'reject',
               'limitations':['Single repeat per live scenario; no statistical confidence.',
+                             'Unknown duration is relevant-five-cell sample-and-hold; full-nine-cell duration, uncovered prefix and maximum evaluation gap are explicit in unknown_intervals. Accounting recovery waits are not continuous observations.',
                              'Observer ASN/DC/physical domains unknown; no independent quorum claim.',
                              'Counter delta includes overhead and possible concurrent probe traffic.',
                              'Both comparators share collection cycles with requested minimum period 5s; actual_cycle_period_ms and cycle_duration_ms record overruns. Production HEAD cadence is 30s.',
