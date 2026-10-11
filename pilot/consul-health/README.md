@@ -25,8 +25,10 @@ python3 -m unittest discover -s pilot/consul-health/tests -p test_consul_pilot.p
 CONSUL_BIN=/absolute/path/consul python3 -m unittest discover -s pilot/consul-health/tests
 ```
 
-Спецификация: `docs/dev/2026-10-11-spec-consul-pilot.md`. Закрепленные blind tests не изменяются implementation.
+Спецификация: [CONSUL-2](../../docs/done/2026-10-11-spec-consul-pilot.md). Итоги: [LAB и DEV](../../docs/done/2026-10-11-consul-pilot-report.md). Закрепленные blind tests не изменяются implementation.
 
 История implementation validation: первый real run не прошел baseline из-за отложенной синхронизации Output при default check_update_interval. Второй завершил baseline и27 fault rows, затем честно завершился CONSUL_API при остановке server: writer ACL resolution зависит от server. Оба failed; не считаются acceptance. Исправления: explicit1s sync и отсутствие ложного утверждения успешной публикации во время cp outage; actual consistent read возвращает unavailable.
 
 Dev freshness baseline: после положительной дельты учета непосредственно перед каждым отказом вновь проверяются прямые пробы и пять необходимых Consul cells. Дополнительные application/accounting ячейки удаленных наблюдателей намеренно unknown. Отчеты и heartbeat должны быть обновлены после начала этой baseline-проверки. 15 секунд — предел принятия baseline: поздно завершившийся sample отклоняется до инъекции; это не асинхронная отмена коллектора. Read-only сбор может ждать индивидуальный adapter timeout до45 секунд. Живой observer-loss длится25 секунд при freshness15 секунд; лабораторный detection/recovery bound15 секунд не меняется.
+
+`run_dev` привязан к текущему стенду: использует существующий `/data/git/cactus-adm-geo-as-count/tools/line-probe/line-probe.py` и `/usr/local/bin/mihomo`1.19.25. Зависимость проверяется до запуска; это не переносимый production collector. После исправления отчетной метрики unknown_duration_ms означает sample-and-hold для пяти проверяемых cells; unknown_intervals отдельно показывает полную матрицу, gaps и метод. Исходные live-артефакты и последующий derived audit разведены в отчете.
