@@ -171,7 +171,7 @@ REQ-CONSUL-09: измерить peak/sampled RSS, CPU seconds, disk bytes соб
 
 ## Источники
 
-- CONSUL-2 owner в клиентском vault: `docs/backlog/CONSUL-2-node-monitoring-pilot.md`; CONSUL-1: `docs/done/2026-10-06-consul-node-monitoring.md`.
+- CONSUL-2 owner в клиентском vault: `docs/done/CONSUL-2-node-monitoring-pilot.md`; CONSUL-1: `docs/done/2026-10-06-consul-node-monitoring.md`.
 - Read-only discovery11.10: dev/prod metadata через PHP bootstrap; Plan::build public endpoint summary; de4 systemctl/ss и публичный installed Python source usage.py/user_driver.py/celery.py. Сырые credentials и логи не сохранены.
 - [HashiCorp Agent checks](https://developer.hashicorp.com/consul/api-docs/agent/check), [Health API](https://developer.hashicorp.com/consul/api-docs/health), [ACL](https://developer.hashicorp.com/consul/docs/secure/acl), [Reliability](https://developer.hashicorp.com/consul/docs/concept/reliability).
 
