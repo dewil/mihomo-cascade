@@ -3,6 +3,33 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
+install_updater() {
+  local dest="${DESTDIR:-}"
+  local src="${SOURCE_DIR:-$SCRIPT_DIR}"
+  local units_dir="${dest}/etc/systemd/system"
+  if ! command -v systemctl >/dev/null 2>&1; then
+    echo "ОШИБКА: updater требует systemd." >&2
+    return 1
+  fi
+  if ! install -d -m 755 "${dest}/usr/local/sbin" "$units_dir"; then
+    return 1
+  fi
+  if ! install -m 755 "${src}/usr/local/sbin/mihomo-update" "${dest}/usr/local/sbin/mihomo-update"; then
+    return 1
+  fi
+  local unit
+  for unit in mihomo-update.service mihomo-update.timer; do
+    if ! install -m 644 "${src}/etc/systemd/system/${unit}" "${units_dir}/${unit}"; then
+      return 1
+    fi
+  done
+  if ! systemctl daemon-reload; then
+    echo "ОШИБКА: daemon-reload после установки updater не выполнен." >&2
+    return 1
+  fi
+  echo "  -> updater установлен; выбор включения таймера сохранен"
+}
+
 # Как и scheduler, эти шаги используют SOURCE_DIR и DESTDIR до проверки root
 # и скачиваний. Явные проверки нужны и при вызове функции через `|| exit $?`.
 install_scripts() {
@@ -233,7 +260,8 @@ if [ "${1:-}" = "--step" ]; then
     scripts) install_scripts || exit $?; exit 0 ;;
     state) install_state || exit $?; exit 0 ;;
     scheduler) install_scheduler || exit $?; exit 0 ;;
-    *) echo "Неизвестный шаг: ${2:-<пусто>} (известны: scripts, state, scheduler)" >&2; exit 1 ;;
+    updater) install_updater || exit $?; exit 0 ;;
+    *) echo "Неизвестный шаг: ${2:-<пусто>} (известны: scripts, state, scheduler, updater)" >&2; exit 1 ;;
   esac
 fi
 
@@ -297,6 +325,15 @@ case "$MODE" in
 esac
 echo "=== Режим установки: ${MODE} ==="
 
+# Capture before any installation writes. Lost subscription.url or forced fresh
+# must not silently opt an existing installation back into code updates.
+UPDATER_NEW_INSTALL=1
+for existing in /usr/local/sbin/mihomo-build-config /etc/systemd/system/mihomo.service /var/lib/mihomo-updater /usr/local/sbin/mihomo-update; do
+  if [ -e "$existing" ] || [ -L "$existing" ]; then
+    UPDATER_NEW_INSTALL=0
+  fi
+done
+
 NOLOGIN_BIN="$(command -v nologin || true)"
 if [ -z "$NOLOGIN_BIN" ]; then
   if [ -x /usr/sbin/nologin ]; then
@@ -310,7 +347,9 @@ if [ -z "$NOLOGIN_BIN" ]; then
 fi
 
 cleanup() {
-  [ -n "$TMP_FETCH" ] && rm -rf "$TMP_FETCH"
+  if [ -n "$TMP_FETCH" ]; then
+    rm -rf "$TMP_FETCH"
+  fi
 }
 trap cleanup EXIT
 
@@ -352,6 +391,9 @@ prepare_source_dir() {
   fetch_from_github "etc/systemd/system/mihomo.service" "${TMP_FETCH}/etc/systemd/system/mihomo.service"
   fetch_from_github "etc/systemd/system/mihomo-refresh.service" "${TMP_FETCH}/etc/systemd/system/mihomo-refresh.service"
   fetch_from_github "etc/systemd/system/mihomo-refresh.timer" "${TMP_FETCH}/etc/systemd/system/mihomo-refresh.timer"
+  fetch_from_github "etc/systemd/system/mihomo-update.service" "${TMP_FETCH}/etc/systemd/system/mihomo-update.service"
+  fetch_from_github "etc/systemd/system/mihomo-update.timer" "${TMP_FETCH}/etc/systemd/system/mihomo-update.timer"
+  fetch_from_github "usr/local/sbin/mihomo-update" "${TMP_FETCH}/usr/local/sbin/mihomo-update"
   fetch_from_github "usr/local/sbin/mihomo-build-config" "${TMP_FETCH}/usr/local/sbin/mihomo-build-config"
   fetch_from_github "usr/local/sbin/mihomo-refresh" "${TMP_FETCH}/usr/local/sbin/mihomo-refresh"
   fetch_from_github "usr/local/sbin/check-route" "${TMP_FETCH}/usr/local/sbin/check-route"
@@ -453,6 +495,7 @@ echo "=== 8. Устанавливаем планировщик обновлен�
 # Ошибка шага роняет установку (set -e): нода без планировщика не обновляется,
 # и узнать об этом по выводу установщика раньше было нельзя.
 install_scheduler
+install_updater
 
 echo "=== 9. Запускаем ==="
 systemctl enable mihomo
@@ -462,6 +505,20 @@ if [ "$MODE" = "fresh" ]; then
 else
   systemctl restart mihomo
   echo "  -> mihomo перезапущен с новыми скриптами/конфигом"
+fi
+
+if [ "$MODE" = "fresh" ] && [ "$UPDATER_NEW_INSTALL" = 1 ]; then
+  if [ "$GITHUB_REPO" = "dewil/mihomo-cascade" ] && [ "$GITHUB_REF" = "main" ] && { [ -z "$INSTALL_SUBDIR" ] || [ "$INSTALL_SUBDIR" = "." ]; }; then
+    /usr/local/sbin/mihomo-update enable --accept-current
+  else
+    echo "  -> custom repo/ref: canonical main updater не включен; ручной выбор: mihomo-update enable --accept-current"
+  fi
+fi
+
+if [ -f /var/lib/mihomo-updater/state.json ] && [ "$UPDATER_NEW_INSTALL" = 0 ]; then
+  # A full manual installation may replace the tracked builder. Do not silently
+  # adopt its bytes or reset the updater's rollback/rejection history.
+  echo "  -> если builder изменился, проверьте mihomo-update status и явно примите новую версию: sudo mihomo-update rebaseline --accept-current"
 fi
 
 echo ""

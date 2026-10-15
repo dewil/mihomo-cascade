@@ -46,6 +46,30 @@ wget -qO- https://raw.githubusercontent.com/dewil/mihomo-cascade/main/install.sh
 
 Режим можно форсировать переменной `MIHOMO_INSTALL_MODE=fresh|update`.
 
+### Автообновление сборщика
+
+На действительно новой стандартной установке после успешного запуска включается
+ежедневное обновление **только `mihomo-build-config`** из `dewil/mihomo-cascade:main`.
+Ядро mihomo и настройки автоматически не обновляются. На существующей установке
+подключение ручное; повторная установка сохраняет выключенный timer. Custom repo/ref
+не переключаются на canonical main автоматически.
+
+Из проверенного полного локального дерева проекта:
+
+```bash
+sudo bash install.sh --step updater
+sudo mihomo-update enable --accept-current
+```
+
+Этот отдельный шаг ставит updater и его два unit, сохраняя остальные файлы и
+работающий mihomo. `--accept-current` явно принимает текущий builder как исходную
+версию. [Проверка, ручное обновление, отключение и откат](docs/autoupdate.md).
+После проверенной ручной замены builder его новую версию можно явно принять
+через `sudo mihomo-update rebaseline --accept-current`; история отката и выбор
+timer сохраняются. Обычные `enable/update --accept-current` локальные изменения
+поверх уже принятой версии не перезаписывают.
+Поддерживается Linux с systemd; поддержка OpenWrt/Entware не заявляется.
+
 ### Если `raw.githubusercontent.com` недоступен (РФ)
 
 В РФ `raw.githubusercontent.com` периодически режется по SSL handshake — `wget | bash` может молча падать с `OpenSSL SSL_ERROR_SYSCALL` ещё до скачивания скриптов. GitHub Releases (`release-assets.githubusercontent.com`, бинарник mihomo) при этом обычно работает, потому что лежит на Azure-blob CDN.
@@ -88,12 +112,15 @@ ssh <host> 'bash /tmp/mihomo-cascade/install.sh && rm -rf /tmp/mihomo-cascade'
 /usr/local/sbin/
   mihomo-build-config              — сборка config.yaml из подписки + правил
   mihomo-refresh                   — пересборка + hot reload без рестарта
+  mihomo-update                    — проверка и атомарное обновление только builder
   mihomo-api                       — чтение Clash API: соединения, группы, задержки
   check-route                      — проверка IP напрямую и через туннель
 /etc/systemd/system/
   mihomo.service                   — сам прокси
   mihomo-refresh.service           — разовый прогон обновления (Type=oneshot)
   mihomo-refresh.timer             — расписание: раз в 2 минуты со случайной задержкой
+  mihomo-update.service            — проверка кандидата и обновление builder
+  mihomo-update.timer              — ежедневно, со случайной задержкой до часа
 ```
 
 ## Как это работает
