@@ -64,6 +64,10 @@ sudo mihomo-update enable --accept-current
 Этот отдельный шаг ставит updater и его два unit, сохраняя остальные файлы и
 работающий mihomo. `--accept-current` явно принимает текущий builder как исходную
 версию. [Проверка, ручное обновление, отключение и откат](docs/autoupdate.md).
+После проверенной ручной замены builder его новую версию можно явно принять
+через `sudo mihomo-update rebaseline --accept-current`; история отката и выбор
+timer сохраняются. Обычные `enable/update --accept-current` локальные изменения
+поверх уже принятой версии не перезаписывают.
 Поддерживается Linux с systemd; поддержка OpenWrt/Entware не заявляется.
 
 ### Если `raw.githubusercontent.com` недоступен (РФ)

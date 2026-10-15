@@ -41,15 +41,28 @@ def timeout(name, default):
         raise Failure('Invalid ' + name.lower() + ' timeout') from None
 
 
-def run(args, seconds, env=None, phase='Command'):
+def run(args, seconds, env=None, phase='Command', output_limit=None):
     # Never expose builder/core/curl output: it can contain subscription secrets.
     try:
-        process = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        process = subprocess.Popen(args, stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.PIPE if output_limit else subprocess.DEVNULL,
                                    stderr=subprocess.DEVNULL, env=env, start_new_session=True)
     except OSError:
         raise Failure(phase + ' could not start') from None
     try:
-        return process.wait(timeout=seconds)
+        result = process.wait(timeout=seconds)
+        if output_limit is None:
+            return result
+        # Used only for the one-word systemctl status responses. Never buffer
+        # unbounded subprocess output; an overfull pipe reaches the same timeout.
+        os.set_blocking(process.stdout.fileno(), False)
+        try:
+            output = os.read(process.stdout.fileno(), output_limit + 1)
+        except BlockingIOError:
+            output = b''
+        if len(output) > output_limit:
+            raise Failure(phase + ' returned excessive output')
+        return result, output
     except BaseException as error:
         # Kill the group, not just the interpreter; curl/grandchildren share it.
         with contextlib.suppress(ProcessLookupError):
@@ -76,6 +89,9 @@ def run(args, seconds, env=None, phase='Command'):
         if isinstance(error, subprocess.TimeoutExpired):
             raise Failure(phase + ' timed out; process group terminated') from None
         raise
+    finally:
+        if process.stdout is not None:
+            process.stdout.close()
 
 
 def atomic(path, data, mode=0o600, uid=None, gid=None):
@@ -374,6 +390,30 @@ class Updater:
     def systemctl(self, *args):
         return run(['systemctl', *args, TIMER], self.command_timeout, phase='Timer control')
 
+    def timer_state(self):
+        # Nonzero alone is ambiguous: it may mean disabled, missing unit or an
+        # unavailable manager. Require a known response AND a compatible code.
+        expected = {
+            'is-enabled': {'enabled': {0}, 'enabled-runtime': {0}, 'disabled': {1},
+                           'masked': {1}, 'masked-runtime': {1}, 'static': {0},
+                           'indirect': {0}, 'linked': {1}, 'linked-runtime': {1},
+                           'alias': {0}, 'generated': {0}, 'transient': {0}},
+            'is-active': {'active': {0}, 'reloading': {0}, 'inactive': {1, 3},
+                          'failed': {1, 3}, 'activating': {1, 3}, 'deactivating': {1, 3}},
+        }
+        states = []
+        for query, known in expected.items():
+            code, output = run(['systemctl', query, TIMER], self.command_timeout,
+                               phase='Timer state query', output_limit=128)
+            try:
+                value = output.decode('ascii').strip()
+            except UnicodeError:
+                raise Failure('Timer state unknown: invalid manager response') from None
+            if value not in known or code not in known[value]:
+                raise Failure('Timer state unknown: manager query failed or unit unavailable')
+            states.append(value)
+        return tuple(states)
+
     def execute(self, command, accepted):
         if command == 'check':
             commit, data = self.fetch()
@@ -383,19 +423,36 @@ class Updater:
             state = self.load()
             print('Installed sha256:', digest(regular(self.builder)))
             print('Tracked state:', json.dumps(state, sort_keys=True) if state else 'untracked')
-            enabled = self.systemctl('is-enabled', '--quiet') == 0
-            active = self.systemctl('is-active', '--quiet') == 0
-            print('Timer:', 'enabled' if enabled else 'disabled', 'active' if active else 'inactive')
+            enabled, active = self.timer_state()
+            print('Timer:', enabled, active)
             return
         with self.lock():
             self.prepare()
             state = self.load()
             if command in ('update', 'rollback') and self.recover(state):
                 return
+            if command == 'rebaseline':
+                if not accepted:
+                    raise Failure('Rebaseline requires explicit --accept-current')
+                if not state:
+                    raise Failure('No tracked baseline; use enable/update --accept-current first')
+                if state.get('pending'):
+                    raise Failure('Pending recovery required; rebaseline refused')
+                data = regular(self.builder)
+                if not data.strip():
+                    raise Failure('Current builder is empty; rebaseline refused')
+                try:
+                    compile(data, '<current-builder>', 'exec')
+                except (ValueError, SyntaxError):
+                    raise Failure('Current builder is not valid Python; rebaseline refused') from None
+                state['installed'] = self.record(data)
+                self.save(state)
+                print('Current builder explicitly accepted as baseline; timer and backups unchanged')
+                return
             if command == 'disable':
                 if self.systemctl('disable', '--now'):
                     raise Failure('Could not disable update timer')
-                if self.systemctl('is-enabled', '--quiet') == 0 or self.systemctl('is-active', '--quiet') == 0:
+                if self.timer_state() != ('disabled', 'inactive'):
                     raise Failure('Update timer disable could not be verified')
                 print('Update timer disabled')
                 return
@@ -405,7 +462,8 @@ class Updater:
             if command == 'enable':
                 if self.systemctl('enable', '--now'):
                     raise Failure('Could not enable update timer')
-                if self.systemctl('is-enabled', '--quiet') or self.systemctl('is-active', '--quiet'):
+                enabled, active = self.timer_state()
+                if enabled not in ('enabled', 'enabled-runtime') or active != 'active':
                     raise Failure('Update timer enable could not be verified')
                 print('Update timer enabled')
             elif command == 'rollback':
@@ -435,11 +493,11 @@ class Updater:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['status', 'check', 'update', 'enable', 'disable', 'rollback'])
+    parser.add_argument('command', choices=['status', 'check', 'update', 'enable', 'disable', 'rollback', 'rebaseline'])
     parser.add_argument('--accept-current', action='store_true', help='explicitly accept untracked baseline')
     args = parser.parse_args()
-    if args.accept_current and args.command not in ('enable', 'update'):
-        parser.error('--accept-current is only valid for enable/update')
+    if args.accept_current and args.command not in ('enable', 'update', 'rebaseline'):
+        parser.error('--accept-current is only valid for enable/update/rebaseline')
     os.umask(0o077)
     def interrupted(signum, frame):
         raise Failure('Update interrupted')

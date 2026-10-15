@@ -347,7 +347,9 @@ if [ -z "$NOLOGIN_BIN" ]; then
 fi
 
 cleanup() {
-  [ -n "$TMP_FETCH" ] && rm -rf "$TMP_FETCH"
+  if [ -n "$TMP_FETCH" ]; then
+    rm -rf "$TMP_FETCH"
+  fi
 }
 trap cleanup EXIT
 
@@ -511,6 +513,12 @@ if [ "$MODE" = "fresh" ] && [ "$UPDATER_NEW_INSTALL" = 1 ]; then
   else
     echo "  -> custom repo/ref: canonical main updater не включен; ручной выбор: mihomo-update enable --accept-current"
   fi
+fi
+
+if [ -f /var/lib/mihomo-updater/state.json ] && [ "$UPDATER_NEW_INSTALL" = 0 ]; then
+  # A full manual installation may replace the tracked builder. Do not silently
+  # adopt its bytes or reset the updater's rollback/rejection history.
+  echo "  -> если builder изменился, проверьте mihomo-update status и явно примите новую версию: sudo mihomo-update rebaseline --accept-current"
 fi
 
 echo ""

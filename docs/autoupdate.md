@@ -23,6 +23,13 @@ sudo mihomo-update enable --accept-current
 согласие обновлять его из canonical main, а не доказательство его происхождения.
 После baseline локальные изменения builder блокируют автоматическую замену,
 даже при повторном `--accept-current`. Сначала сохраните и разберите свои изменения.
+Если новая версия поставлена вручную и проверена, примите ее отдельной командой
+`sudo mihomo-update rebaseline --accept-current`. Она проверяет, что установленный
+builder — обычный непустой файл с корректным Python, и меняет только текущую
+учетную запись. Предыдущий backup, список rejected и выбор timer сохраняются;
+сетевых запросов и перезапуска нет. Это явное принятие версии, не проверка ее
+работоспособности. При незавершенной транзакции сначала нужен recovery через
+`update` или `rollback`: rebaseline такую транзакцию не скрывает.
 Custom repo/ref не включают canonical updater автоматически; ручное включение
 означает явный выбор `dewil/mihomo-cascade:main`.
 
@@ -36,11 +43,16 @@ sudo mihomo-update update --accept-current # первый ручной update б
 sudo mihomo-update disable                # отключить только updater timer
 sudo mihomo-update enable                 # включить его снова
 sudo mihomo-update rollback               # вернуть предыдущий builder
+sudo mihomo-update rebaseline --accept-current # принять проверенную ручную замену
 journalctl -u mihomo-update.service
 systemctl list-timers mihomo-update.timer
 ```
 
 Timer запускается ежедневно со случайной задержкой до часа, `Persistent=true`.
+Status показывает распознанные состояния systemd. Ошибка manager/D-Bus,
+отсутствующий unit или неизвестный ответ возвращают ошибку «state unknown»;
+они не выдаются за отключенный timer. Enable и disable проверяют результат
+аналогично и не сообщают успех, если состояние проверить не удалось.
 Отключение не отменяет уже выполняющийся update; изменяющие команды сериализованы
 общим lock `/run/mihomo-refresh.lock`. Этот lock также принимает штатный refresh
 timer. Старый startup unit и прямой ручной builder его не принимают; updater
