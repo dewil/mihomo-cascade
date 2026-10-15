@@ -1,0 +1,463 @@
+#!/usr/bin/env python3
+"""Opt-in builder updates; immutable upstream, staged validation, atomic code only."""
+import argparse
+import contextlib
+import fcntl
+import hashlib
+import json
+import math
+import os
+from pathlib import Path, PurePosixPath
+import re
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+API = 'https://api.github.com/repos/dewil/mihomo-cascade/commits/main'
+RAW = 'https://raw.githubusercontent.com/dewil/mihomo-cascade/{}/usr/local/sbin/mihomo-build-config'
+TIMER = 'mihomo-update.timer'
+LIMIT = 1024 * 1024
+
+
+class Failure(Exception):
+    pass
+
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def timeout(name, default):
+    try:
+        value = float(os.environ.get('MIHOMO_UPDATE_' + name + '_TIMEOUT', default))
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError
+        return value
+    except ValueError:
+        raise Failure('Invalid ' + name.lower() + ' timeout') from None
+
+
+def run(args, seconds, env=None, phase='Command'):
+    # Never expose builder/core/curl output: it can contain subscription secrets.
+    try:
+        process = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL, env=env, start_new_session=True)
+    except OSError:
+        raise Failure(phase + ' could not start') from None
+    try:
+        return process.wait(timeout=seconds)
+    except BaseException as error:
+        # Kill the group, not just the interpreter; curl/grandchildren share it.
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+        process.wait()
+        # SIGKILL is asynchronous. Wait for live members to disappear; zombies
+        # have stopped executing and are left for their parent/init to reap.
+        deadline = time.monotonic() + 5
+        while True:
+            living = False
+            for entry in Path('/proc').glob('[0-9]*/stat'):
+                try:
+                    fields = entry.read_text().rsplit(')', 1)[1].split()
+                    if int(fields[2]) == process.pid and fields[0] != 'Z':
+                        living = True
+                        break
+                except (OSError, ValueError, IndexError):
+                    continue
+            if not living:
+                break
+            if time.monotonic() >= deadline:
+                raise Failure('Timed-out process group termination could not be confirmed') from None
+            time.sleep(0.02)
+        if isinstance(error, subprocess.TimeoutExpired):
+            raise Failure(phase + ' timed out; process group terminated') from None
+        raise
+
+
+def atomic(path, data, mode=0o600, uid=None, gid=None):
+    fd, temporary = tempfile.mkstemp(prefix='.' + path.name + '-', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'wb') as stream:
+            stream.write(data)
+            stream.flush()
+            if uid is not None:
+                os.fchown(stream.fileno(), uid, gid)
+            os.fchmod(stream.fileno(), mode)
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary)
+
+
+def regular(path):
+    if not stat.S_ISREG(path.lstat().st_mode):
+        raise Failure('Expected a regular file; refusing symlink or special file')
+    return path.read_bytes()
+
+
+def check_paths(text):
+    # SIMPLIFIED: a conservative YAML token scan, not a YAML implementation.
+    # Only simple scalar filesystem paths are accepted; complex forms fail closed.
+    tokens = re.compile(r'''"(?:\\.|[^"\\])*"|'(?:''|[^'])*'|[{}\[\],:]|[^\s{}\[\],:#]+|\#.*''')
+    path_keys = {'path', 'external-ui', 'external-ui-name', 'external-controller-unix',
+                 'certificate', 'private-key', 'ca-file', 'client-cert', 'client-key',
+                 'log-file'}
+    parents = []
+    for line in text.splitlines():
+        if not line.strip() or line.lstrip().startswith('#'):
+            continue
+        indent = len(line) - len(line.lstrip())
+        while parents and parents[-1][0] >= indent:
+            parents.pop()
+        parts = tokens.findall(line)
+        if line.lstrip().startswith(('?', '%')):
+            raise Failure('Unsupported complex YAML mapping in staged configuration')
+        context = [key for _, key in parents]
+        inline = []
+        last_key = None
+        for i, token in enumerate(parts):
+            if token.startswith('#'):
+                break
+            if token == '{':
+                inline.append(last_key)
+                continue
+            if token == '}':
+                if inline:
+                    inline.pop()
+                continue
+            if i + 1 >= len(parts) or parts[i + 1] != ':':
+                continue
+            try:
+                key = json.loads(token) if token.startswith('"') else token.strip("'")
+            except ValueError:
+                raise Failure('Unsupported YAML key in staged configuration') from None
+            if key.startswith('*') or key == '<<':
+                raise Failure('Unsupported YAML alias or merge key in staged configuration')
+            last_key = key
+            if i + 2 == len(parts) or parts[i + 2].startswith('#'):
+                parents.append((indent, key))
+            if key not in path_keys:
+                continue
+            ancestors = context + inline
+            if (key == 'path' and 'proxies' in ancestors
+                    and any(k in ancestors for k in ('ws-opts', 'http-opts', 'h2-opts'))
+                    and not any(k in ancestors for k in ('proxy-providers', 'rule-providers'))):
+                continue  # HTTP request path, not a filesystem path.
+            if i + 2 >= len(parts):
+                raise Failure('Unsupported multiline filesystem path in staged configuration')
+            value = parts[i + 2]
+            if (i + 3 < len(parts) and parts[i + 3] not in (',', '}', ']')
+                    and not parts[i + 3].startswith('#')):
+                raise Failure('Unsupported filesystem path syntax in staged configuration')
+            try:
+                if value.startswith('"'):
+                    value = json.loads(value)
+                elif value.startswith("'"):
+                    value = value[1:-1].replace("''", "'")
+            except ValueError:
+                raise Failure('Invalid filesystem path in staged configuration') from None
+            if (not value or value[0] in '*&!|>{[' or '\\' in value
+                    or value.startswith(('~', '/')) or '..' in PurePosixPath(value).parts
+                    or re.match(r'^[A-Za-z]:', value)):
+                raise Failure('Unsafe filesystem path in staged configuration')
+
+
+class Updater:
+    def __init__(self):
+        root = os.environ.get('MIHOMO_UPDATE_ROOT', '')
+        self.root = Path(root or '/')
+        if not self.root.is_absolute():
+            raise Failure('MIHOMO_UPDATE_ROOT must be absolute')
+        self.builder = self.root / 'usr/local/sbin/mihomo-build-config'
+        self.base = self.root / 'etc/mihomo'
+        self.core = self.root / 'usr/local/bin/mihomo'
+        self.directory = self.root / 'var/lib/mihomo-updater'
+        self.state_path = self.directory / 'state.json'
+        self.backups = self.directory / 'backups'
+        self.command_timeout = timeout('COMMAND', 240)
+        self.fetch_timeout = timeout('FETCH', 90)
+        self.lock_timeout = timeout('LOCK', 30)
+
+    @contextlib.contextmanager
+    def lock(self):
+        if os.geteuid() != 0 and self.root == Path('/'):
+            raise Failure('This operation requires root')
+        path = self.root / 'run/mihomo-refresh.lock'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        try:
+            deadline = time.monotonic() + self.lock_timeout
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise Failure('Refresh lock timeout') from None
+                    time.sleep(0.05)
+            yield
+        finally:
+            os.close(fd)
+
+    def prepare(self):
+        for path in (self.directory, self.backups):
+            if path.is_symlink():
+                raise Failure('Updater state directory must not be a symlink')
+            path.mkdir(parents=True, exist_ok=True, mode=0o700)
+            path.chmod(0o700)
+
+    def load(self):
+        if not self.state_path.exists():
+            return None
+        state = json.loads(regular(self.state_path))
+        if state.get('schema_version') != 1:
+            raise Failure('Unsupported updater state schema')
+        return state
+
+    def save(self, state):
+        atomic(self.state_path, (json.dumps(state, sort_keys=True) + '\n').encode())
+
+    def record(self, data, commit=None):
+        info = self.builder.lstat()
+        return dict(sha256=digest(data), commit=commit, mode=stat.S_IMODE(info.st_mode),
+                    uid=info.st_uid, gid=info.st_gid)
+
+    def baseline(self, state, accepted):
+        if state is None:
+            if not accepted:
+                raise Failure('Untracked builder: explicitly use --accept-current to establish baseline')
+            state = dict(schema_version=1, installed=self.record(regular(self.builder)),
+                         previous=None, rejected=[], pending=None)
+            self.save(state)
+        if digest(regular(self.builder)) != state['installed']['sha256']:
+            raise Failure('Installed builder has local changes; refusing overwrite')
+        return state
+
+    def backup(self, record, data):
+        path = self.backups / (record['sha256'] + '.py')
+        if path.exists() or path.is_symlink():
+            if digest(regular(path)) != record['sha256']:
+                raise Failure('Existing backup hash mismatch')
+        else:
+            atomic(path, data)
+
+    def backup_bytes(self, record):
+        if not re.fullmatch('[0-9a-f]{64}', record['sha256']):
+            raise Failure('Invalid backup hash')
+        data = regular(self.backups / (record['sha256'] + '.py'))
+        if digest(data) != record['sha256']:
+            raise Failure('Backup hash mismatch; refusing restore')
+        return data
+
+    def install(self, data, record):
+        atomic(self.builder, data, record['mode'], record['uid'], record['gid'])
+
+    def recover(self, state):
+        pending = state.get('pending') if state else None
+        if not pending:
+            return False
+        before, after = pending['before'], pending['after']
+        current = digest(regular(self.builder))
+        if current not in (before['sha256'], after['sha256']):
+            raise Failure('Pending transaction conflicts with local builder changes')
+        data = self.backup_bytes(before)
+        if current != before['sha256']:
+            self.install(data, before)
+        state['installed'] = before
+        state['pending'] = None
+        state['rejected'] = sorted(set(state['rejected'] + [after['sha256']]))
+        self.save(state)
+        print('Recovered interrupted update; previous builder restored')
+        return True
+
+    def fetch(self):
+        with tempfile.TemporaryDirectory(prefix='mihomo-update-fetch-') as directory:
+            output = Path(directory) / 'response'
+            def download(url):
+                rc = run(['curl', '--fail', '--silent', '--show-error', '--proto', '=https',
+                          '--max-redirs', '0', '--noproxy', '*', '--connect-timeout', '15',
+                          '--max-time', str(self.fetch_timeout), '--max-filesize', str(LIMIT),
+                          '-o', str(output), url], self.fetch_timeout + 1, phase='Upstream download')
+                if rc or not output.is_file() or not 0 < output.stat().st_size <= LIMIT:
+                    raise Failure('Upstream download failed or exceeded size limit')
+                return output.read_bytes()
+            try:
+                metadata = json.loads(download(API))
+            except ValueError:
+                raise Failure('Upstream metadata is not valid JSON') from None
+            if not isinstance(metadata, dict):
+                raise Failure('Upstream metadata is not an object')
+            commit = metadata.get('sha', '')
+            if not isinstance(commit, str) or not re.fullmatch('[0-9a-fA-F]{40}', commit):
+                raise Failure('Upstream returned invalid commit SHA')
+            data = download(RAW.format(commit))
+            try:
+                compile(data, '<candidate>', 'exec')
+            except (ValueError, SyntaxError):
+                raise Failure('Candidate is not valid Python') from None
+            return commit, data
+
+    def validate(self, data):
+        if not self.core.is_file() or not os.access(self.core, os.X_OK):
+            raise Failure('Installed mihomo core is unavailable for validation')
+        with tempfile.TemporaryDirectory(prefix='stage-', dir=self.directory) as directory:
+            stage = Path(directory)
+            # Copy regular files only. Never preserve symlinks into live state.
+            # cache.db is an unrelated live runtime symlink and is intentionally omitted.
+            def copy_inputs(source, target):
+                for entry in source.iterdir():
+                    if entry.name == 'cache.db':
+                        continue
+                    mode = entry.lstat().st_mode
+                    destination = target / entry.name
+                    if stat.S_ISDIR(mode):
+                        destination.mkdir(mode=0o700)
+                        copy_inputs(entry, destination)
+                    elif stat.S_ISREG(mode):
+                        destination.write_bytes(entry.read_bytes())
+                        destination.chmod(0o600)
+                    else:
+                        raise Failure('Staging input contains unsupported symlink or special file')
+            copy_inputs(self.base, stage)
+            candidate = stage / '.candidate.py'
+            candidate.write_bytes(data)
+            env = dict(os.environ, MIHOMO_BASE=str(stage), PYTHONDONTWRITEBYTECODE='1')
+            env.pop('MIHOMO_ALLOW_SHRINK', None)
+            if run([sys.executable, str(candidate)], self.command_timeout, env, 'Candidate validation'):
+                raise Failure('Candidate builder rejected staged configuration')
+            config = stage / 'config.yaml'
+            check_paths(regular(config).decode('utf-8'))
+            # A candidate may create provider symlinks; reject before the core sees them.
+            for path in stage.rglob('*'):
+                if path.is_symlink():
+                    raise Failure('Staged configuration contains a symlink')
+            if run([str(self.core), '-t', '-d', str(stage), '-f', str(config)],
+                   self.command_timeout, env, 'Core validation'):
+                raise Failure('Installed mihomo rejected staged configuration')
+
+    def transition(self, state, data, after, rejected=None):
+        before = state['installed']
+        previous = state.get('previous')
+        self.backup(before, regular(self.builder))
+        state['pending'] = dict(before=before, after=after)
+        self.save(state)
+        try:
+            self.install(data, after)
+            state['installed'], state['previous'] = after, before
+            state['pending'] = None
+            if rejected:
+                state['rejected'] = sorted(set(state['rejected'] + [rejected]))
+            self.save(state)
+        except BaseException:
+            # Pending on disk remains recoverable even if this rollback/save fails.
+            try:
+                self.install(self.backup_bytes(before), before)
+                state['installed'] = before
+                state['previous'] = previous
+                state['pending'] = None
+                state['rejected'] = sorted(set(state['rejected'] + [after['sha256']]))
+                self.save(state)
+            except BaseException:
+                raise Failure('Transaction failed; rollback unconfirmed; pending recovery required') from None
+            raise Failure('Transaction failed; previous builder restored') from None
+
+    def systemctl(self, *args):
+        return run(['systemctl', *args, TIMER], self.command_timeout, phase='Timer control')
+
+    def execute(self, command, accepted):
+        if command == 'check':
+            commit, data = self.fetch()
+            print('Available commit:', commit, 'sha256:', digest(data))
+            return
+        if command == 'status':
+            state = self.load()
+            print('Installed sha256:', digest(regular(self.builder)))
+            print('Tracked state:', json.dumps(state, sort_keys=True) if state else 'untracked')
+            enabled = self.systemctl('is-enabled', '--quiet') == 0
+            active = self.systemctl('is-active', '--quiet') == 0
+            print('Timer:', 'enabled' if enabled else 'disabled', 'active' if active else 'inactive')
+            return
+        with self.lock():
+            self.prepare()
+            state = self.load()
+            if command in ('update', 'rollback') and self.recover(state):
+                return
+            if command == 'disable':
+                if self.systemctl('disable', '--now'):
+                    raise Failure('Could not disable update timer')
+                if self.systemctl('is-enabled', '--quiet') == 0 or self.systemctl('is-active', '--quiet') == 0:
+                    raise Failure('Update timer disable could not be verified')
+                print('Update timer disabled')
+                return
+            state = self.baseline(state, accepted)
+            if state.get('pending'):
+                raise Failure('Pending recovery required; run update or rollback first')
+            if command == 'enable':
+                if self.systemctl('enable', '--now'):
+                    raise Failure('Could not enable update timer')
+                if self.systemctl('is-enabled', '--quiet') or self.systemctl('is-active', '--quiet'):
+                    raise Failure('Update timer enable could not be verified')
+                print('Update timer enabled')
+            elif command == 'rollback':
+                previous = state.get('previous')
+                if not previous:
+                    raise Failure('No previous builder available')
+                if previous['sha256'] in state['rejected']:
+                    raise Failure('Previous builder was rejected; refusing reinstall')
+                rejected = state['installed']['sha256']
+                self.transition(state, self.backup_bytes(previous), previous, rejected)
+                print('Previous builder restored; rejected candidate will not be reinstalled')
+            else:
+                commit, data = self.fetch()
+                after = self.record(data, commit)
+                if after['sha256'] == state['installed']['sha256']:
+                    print('Builder unchanged; backup retained')
+                    return
+                if after['sha256'] in state['rejected']:
+                    raise Failure('Candidate hash was rejected; refusing reinstall')
+                self.validate(data)
+                # Direct local edits are outside the shared lock contract. Recheck anyway.
+                if digest(regular(self.builder)) != state['installed']['sha256']:
+                    raise Failure('Builder changed during validation; refusing overwrite')
+                self.transition(state, data, after)
+                print('Builder installed:', commit, after['sha256'], '(next regular refresh applies configuration)')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('command', choices=['status', 'check', 'update', 'enable', 'disable', 'rollback'])
+    parser.add_argument('--accept-current', action='store_true', help='explicitly accept untracked baseline')
+    args = parser.parse_args()
+    if args.accept_current and args.command not in ('enable', 'update'):
+        parser.error('--accept-current is only valid for enable/update')
+    os.umask(0o077)
+    def interrupted(signum, frame):
+        raise Failure('Update interrupted')
+    signal.signal(signal.SIGTERM, interrupted)
+    signal.signal(signal.SIGINT, interrupted)
+    try:
+        Updater().execute(args.command, args.accept_current)
+    except Failure as error:
+        print('mihomo-update:', error, file=sys.stderr)
+        return 1
+    except subprocess.TimeoutExpired:
+        print('mihomo-update: subprocess timeout; process group terminated', file=sys.stderr)
+        return 1
+    except (OSError, ValueError, KeyError, TypeError):
+        print('mihomo-update: filesystem, transport or state validation failed', file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

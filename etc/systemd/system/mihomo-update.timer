@@ -1,0 +1,11 @@
+[Unit]
+Description=Mihomo cascade: daily builder update
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=1h
+Persistent=true
+Unit=mihomo-update.service
+
+[Install]
+WantedBy=timers.target

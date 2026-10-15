@@ -1,0 +1,12 @@
+[Unit]
+Description=Mihomo cascade: validate and update builder code
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/local/sbin/mihomo-update update
+TimeoutStartSec=15min
+KillMode=control-group
+UMask=0077
