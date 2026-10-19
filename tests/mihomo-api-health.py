@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import socket
 import threading
 import unittest
 
@@ -33,7 +34,7 @@ def payload(members=None):
 
 
 class HealthContract(unittest.TestCase):
-    def invoke(self, body, json_mode=True, status=200):
+    def invoke(self, body, json_mode=True, status=200, redirect=False):
         calls = []
         raw = body if isinstance(body, bytes) else json.dumps(body).encode()
 
@@ -42,6 +43,8 @@ class HealthContract(unittest.TestCase):
                 calls.append(('GET', self.path))
                 self.send_response(status)
                 self.send_header('Content-Type', 'application/json')
+                if redirect:
+                    self.send_header('Location', '/redirect-target/' + SECRET)
                 self.end_headers()
                 self.wfile.write(raw)
 
@@ -128,6 +131,13 @@ class HealthContract(unittest.TestCase):
                 self.assertEqual(entry['status'], 'up')
                 self.assertIsNotNone(entry['checked_at'])
 
+    def test_rfc3339_nanosecond_timestamp_is_fresh(self):
+        now = dt.datetime.now(dt.timezone.utc)
+        nano_time = now.strftime('%Y-%m-%dT%H:%M:%S.') + ('%06d' % now.microsecond) + '123Z'
+        _, entry = self.state(member(when=nano_time))
+        self.assertEqual(entry['status'], 'up')
+        self.assertIsNotNone(entry['checked_at'])
+
     def test_unknown_delay_and_alive(self):
         for value in [None, -1, '12', True, 1.5]:
             with self.subTest(delay=value):
@@ -181,12 +191,50 @@ class HealthContract(unittest.TestCase):
                 self.assertNotEqual(self.invoke(body).returncode, 0)
         self.assertNotEqual(self.invoke({'error': SECRET}, status=500).returncode, 0)
 
+    def test_redirect_is_not_followed(self):
+        for status in [301, 302, 303, 307, 308]:
+            with self.subTest(status=status):
+                result = self.invoke(b'redirect body ' + SECRET.encode(),
+                                     status=status, redirect=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn('redirect body', result.stdout + result.stderr)
+                self.assertNotIn('redirect-target', result.stdout + result.stderr)
+
+    def test_connection_refused_is_safe(self):
+        # A bound socket without listen reserves an unused port and rejects TCP.
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reserved:
+            reserved.bind(('127.0.0.1', 0))
+            endpoint = 'http://127.0.0.1:%s/%s' % (reserved.getsockname()[1], SECRET)
+            result = subprocess.run(
+                ['python3', str(ROOT / 'usr/local/sbin/mihomo-api'), 'health', '--json'],
+                env=dict(os.environ, MIHOMO_API=endpoint),
+                capture_output=True, text=True, timeout=10)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn(SECRET, result.stdout + result.stderr)
+        self.assertNotIn('Traceback', result.stdout + result.stderr)
+
+    def test_help_distinguishes_active_delay_from_passive_health(self):
+        result = subprocess.run(
+            ['python3', str(ROOT / 'usr/local/sbin/mihomo-api'), '--help'],
+            capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        help_text = result.stdout.lower()
+        health_line = next(line for line in help_text.splitlines()
+                           if 'mihomo-api health' in line)
+        delay_line = next(line for line in help_text.splitlines()
+                          if 'mihomo-api delay' in line)
+        self.assertRegex(health_line, r'пассивн|passive')
+        self.assertRegex(delay_line, r'активн|active')
+        self.assertRegex(delay_line, r'обнов|updat')
+        self.assertIn('health', delay_line)
+
     def test_text_statuses_and_all_down_explanation(self):
         body = payload({'up-node': member(), 'down-node': member(False), 'unknown-node': {}})
         result = self.invoke(body, json_mode=False)
         self.assertEqual(result.returncode, 0, result.stderr)
-        for label in ['доступен', 'недоступен', 'не определено']:
-            self.assertIn(label, result.stdout.lower())
+        for name, label in [('up-node', 'доступен'), ('down-node', 'недоступен'),
+                            ('unknown-node', 'не определено')]:
+            self.assertRegex(result.stdout.lower(), name + r':\s*' + label + r'(?=\W|$)')
         result = self.invoke(payload({'primary': member(False)}), json_mode=False)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('не означает', result.stdout.lower())

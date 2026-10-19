@@ -386,7 +386,8 @@ mihomo-api health --json > "mihomo-health-$(date -u +%Y%m%dT%H%M%SZ).json"
 ```
 
 Автоматической записи и фоновой службы нет. В отличие от пассивного `health`,
-`mihomo-api delay` активно запускает пробу и обновляет health-состояние.
+`mihomo-api delay` активно запускает пробу и обновляет состояние проверки ее URL.
+Если URL отличается от URL fallback-группы, ее per-URL состояние эта проба не обновляет.
 
 ## Каскад поверх Hiddify
 

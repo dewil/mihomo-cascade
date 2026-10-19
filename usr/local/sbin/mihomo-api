@@ -23,6 +23,7 @@ import http.client
 import json
 import os
 import pathlib
+import re
 import sys
 import urllib.error
 import urllib.parse
@@ -52,9 +53,15 @@ def _secret() -> str:
 
 
 def _get(path: str, timeout: int = 10, safe_errors: bool = False):
+    if safe_errors:
+        try:
+            sec = _secret()
+        except OSError:
+            sys.exit("Не удалось прочитать конфигурацию авторизации API")
+    else:
+        sec = _secret()
     try:
         req = urllib.request.Request(API + path)
-        sec = _secret()
         if sec:
             req.add_header("Authorization", f"Bearer {sec}")
         # health promises one request; redirects must not forward its credentials.
@@ -169,6 +176,9 @@ def _member_health(name, node, url, observed: dt.datetime) -> dict:
     if not isinstance(timestamp, str):
         return result
     try:
+        # Python 3.10 accepts microseconds, while Go emits up to nanoseconds.
+        timestamp = re.sub(r"(\d{2}:\d{2}:\d{2})\.(\d{1,9})(?=Z$|[+-]\d{2}:\d{2}$)",
+                           lambda match: match[1] + "." + match[2][:6].ljust(6, "0"), timestamp)
         checked = dt.datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
         if checked.tzinfo is None:
             return result
