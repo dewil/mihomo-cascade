@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Black-box contract tests; intentionally independent of CLI implementation."""
+"""Black-box contract tests. Requires Linux + bwrap; never reads host config."""
 import datetime as dt
 import http.server
 import json
@@ -7,6 +7,9 @@ import os
 from pathlib import Path
 import subprocess
 import socket
+import shutil
+import sys
+import tempfile
 import threading
 import unittest
 
@@ -34,6 +37,18 @@ def payload(members=None):
 
 
 class HealthContract(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        if not sys.platform.startswith('linux') or shutil.which('bwrap') is None:
+            raise RuntimeError('Health CLI tests require Linux + bwrap for config isolation')
+
+    def command(self, *args, config=None):
+        command = ['bwrap', '--ro-bind', '/', '/', '--tmpfs', '/etc/mihomo',
+                   '--dev-bind', '/dev', '/dev', '--proc', '/proc']
+        if config is not None:
+            command += ['--ro-bind', str(config), '/etc/mihomo/config.yaml']
+        return command + ['--', 'python3', str(ROOT / 'usr/local/sbin/mihomo-api'), *args]
+
     def invoke(self, body, json_mode=True, status=200, redirect=False):
         calls = []
         raw = body if isinstance(body, bytes) else json.dumps(body).encode()
@@ -63,9 +78,9 @@ class HealthContract(unittest.TestCase):
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
-            env = dict(os.environ, MIHOMO_API='http://127.0.0.1:%s' % server.server_port)
-            result = subprocess.run(['python3', str(ROOT / 'usr/local/sbin/mihomo-api'),
-                                     'health'] + (['--json'] if json_mode else []),
+            env = dict(os.environ, MIHOMO_API='http://127.0.0.1:%s' % server.server_port,
+                       NO_PROXY='127.0.0.1,localhost', no_proxy='127.0.0.1,localhost')
+            result = subprocess.run(self.command('health', *(['--json'] if json_mode else [])),
                                     env=env, capture_output=True, text=True, timeout=10)
         finally:
             server.shutdown()
@@ -206,16 +221,58 @@ class HealthContract(unittest.TestCase):
             reserved.bind(('127.0.0.1', 0))
             endpoint = 'http://127.0.0.1:%s/%s' % (reserved.getsockname()[1], SECRET)
             result = subprocess.run(
-                ['python3', str(ROOT / 'usr/local/sbin/mihomo-api'), 'health', '--json'],
-                env=dict(os.environ, MIHOMO_API=endpoint),
+                self.command('health', '--json'),
+                env=dict(os.environ, MIHOMO_API=endpoint, NO_PROXY='127.0.0.1,localhost',
+                         no_proxy='127.0.0.1,localhost'),
                 capture_output=True, text=True, timeout=10)
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn(SECRET, result.stdout + result.stderr)
         self.assertNotIn('Traceback', result.stdout + result.stderr)
 
+    @unittest.skipIf(os.geteuid() == 0, 'root bypasses mode 000; permission case requires nonroot')
+    def test_unreadable_config_is_safe_and_does_not_request_api(self):
+        calls = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                calls.append(self.path)
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'{"proxies": {}}')
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory(prefix='health-config-test-') as directory:
+                config = Path(directory) / 'config.yaml'
+                config.write_text('secret: ' + SECRET + '\n')
+                config.chmod(0)
+                try:
+                    result = subprocess.run(
+                        self.command('health', '--json', config=config),
+                        env=dict(os.environ, MIHOMO_API='http://127.0.0.1:%s' % server.server_port,
+                                 NO_PROXY='127.0.0.1,localhost', no_proxy='127.0.0.1,localhost'),
+                        capture_output=True, text=True, timeout=10)
+                finally:
+                    config.chmod(0o600)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+        output = result.stdout + result.stderr
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(calls, [])
+        self.assertNotIn(SECRET, output)
+        self.assertNotIn('Traceback', output)
+        self.assertRegex(output.lower(), r'конфиг|config|авторизац|auth')
+
     def test_help_distinguishes_active_delay_from_passive_health(self):
         result = subprocess.run(
-            ['python3', str(ROOT / 'usr/local/sbin/mihomo-api'), '--help'],
+            self.command('--help'),
             capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
         help_text = result.stdout.lower()
