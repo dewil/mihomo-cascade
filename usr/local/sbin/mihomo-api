@@ -8,14 +8,18 @@
 
     mihomo-api conns [подстрока]   активные соединения: хост, правило, цепочка, трафик
     mihomo-api groups              группы и выбранный в каждой узел
-    mihomo-api delay <имя> [url]   замер задержки узла или группы
+    mihomo-api health [--json]     пассивный снимок проверок fallback-групп
+    mihomo-api delay <имя> [url]   активная проба, обновляющая health-состояние
 
-Только чтение: ничего не переключает и не применяет. Адрес API берется из
+conns, groups и health только читают состояние. delay запускает проверку.
+Адрес API берется из
 MIHOMO_API (по умолчанию http://127.0.0.1:9090), пароль - из secret в
 /etc/mihomo/config.yaml, если он там задан.
 """
 from __future__ import annotations
 
+import datetime as dt
+import http.client
 import json
 import os
 import pathlib
@@ -26,6 +30,11 @@ import urllib.request
 
 API = os.environ.get("MIHOMO_API", "http://127.0.0.1:9090")
 CFG = pathlib.Path("/etc/mihomo/config.yaml")
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 
 def _secret() -> str:
@@ -42,18 +51,29 @@ def _secret() -> str:
     return ""
 
 
-def _get(path: str, timeout: int = 10):
-    req = urllib.request.Request(API + path)
-    sec = _secret()
-    if sec:
-        req.add_header("Authorization", f"Bearer {sec}")
+def _get(path: str, timeout: int = 10, safe_errors: bool = False):
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        req = urllib.request.Request(API + path)
+        sec = _secret()
+        if sec:
+            req.add_header("Authorization", f"Bearer {sec}")
+        # health promises one request; redirects must not forward its credentials.
+        open_request = (urllib.request.build_opener(_NoRedirect).open
+                        if safe_errors else urllib.request.urlopen)
+        with open_request(req, timeout=timeout) as r:
             return json.load(r)
     except urllib.error.HTTPError as e:
+        if safe_errors:
+            sys.exit(f"Не удалось прочитать состояние API: HTTP {e.code}")
         sys.exit(f"API ответил {e.code} на {path}: {e.read()[:200].decode('utf-8', 'replace')}")
     except OSError as e:
+        if safe_errors:
+            sys.exit("Не удалось прочитать состояние API: ошибка соединения")
         sys.exit(f"Нет связи с {API}: {e}. mihomo запущен? external-controller на месте?")
+    except (ValueError, http.client.HTTPException):
+        if safe_errors:
+            sys.exit("Не удалось прочитать состояние API: некорректный ответ или адрес")
+        raise
 
 
 def _human(n: float) -> str:
@@ -133,7 +153,89 @@ def cmd_delay(argv: list[str]) -> int:
     return 0
 
 
-COMMANDS = {"conns": cmd_conns, "groups": cmd_groups, "delay": cmd_delay}
+def _member_health(name, node, url, observed: dt.datetime) -> dict:
+    result = {"name": name, "status": "unknown", "checked_at": None, "delay_ms": None}
+    if not isinstance(node, dict) or not isinstance(url, str) or not url:
+        return result
+    extra = node.get("extra")
+    check = extra.get(url) if isinstance(extra, dict) else None
+    if not isinstance(check, dict):
+        return result
+    history = check.get("history")
+    if not isinstance(history, list) or not history or not isinstance(history[-1], dict):
+        return result
+    latest = history[-1]
+    timestamp = latest.get("time")
+    if not isinstance(timestamp, str):
+        return result
+    try:
+        checked = dt.datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        if checked.tzinfo is None:
+            return result
+        checked = checked.astimezone(dt.timezone.utc)
+    except (ValueError, OverflowError):
+        return result
+    result["checked_at"] = checked.isoformat()
+    age = (observed - checked).total_seconds()
+    alive = check.get("alive")
+    if not -5 <= age <= 90 or not isinstance(alive, bool):
+        return result
+    if not alive:
+        result["status"] = "down"
+    else:
+        delay = latest.get("delay")
+        if type(delay) is int and delay >= 0:
+            result.update(status="up", delay_ms=delay)
+    return result
+
+
+def cmd_health(argv: list[str]) -> int:
+    if argv not in ([], ["--json"]):
+        sys.exit("использование: mihomo-api health [--json]")
+    data = _get("/proxies", safe_errors=True)
+    if not isinstance(data, dict) or not isinstance(data.get("proxies"), dict):
+        sys.exit("Не удалось прочитать состояние API: некорректный список proxies")
+    observed = dt.datetime.now(dt.timezone.utc)
+    proxies = data["proxies"]
+    groups = []
+    for name, group in proxies.items():
+        if not isinstance(group, dict) or group.get("type") != "Fallback":
+            continue
+        names = group.get("all")
+        members = []
+        if isinstance(names, list):
+            for member_name in names:
+                valid_name = isinstance(member_name, str)
+                members.append(_member_health(
+                    member_name if valid_name else None,
+                    proxies.get(member_name) if valid_name else None,
+                    group.get("testUrl"), observed))
+        states = [member["status"] for member in members]
+        status = ("available" if "up" in states else
+                  "all_down" if states and all(state == "down" for state in states) else
+                  "unknown")
+        selected = group.get("now")
+        groups.append({"name": name, "selected": selected if isinstance(selected, str) else None,
+                       "status": status, "members": members})
+    report = {"schema_version": 1, "observed_at": observed.isoformat(), "groups": groups}
+    if argv:
+        print(json.dumps(report, ensure_ascii=False))
+        return 0
+    print(f"Снимок проверок: {report['observed_at']}")
+    labels = {"up": "доступен", "down": "недоступен", "unknown": "не определено",
+              "available": "есть доступный участник", "all_down": "все участники недоступны"}
+    for group in groups:
+        print(f"{group['name']}: {labels[group['status']]}; выбран: {group['selected'] or '-'}")
+        if group["status"] == "all_down":
+            print("  Выбор первой ноды не означает ее доступность.")
+        for member in group["members"]:
+            delay = f"{member['delay_ms']} мс" if member["delay_ms"] is not None else "-"
+            print(f"  {member['name'] or '?'}: {labels[member['status']]}; "
+                  f"проверка: {member['checked_at'] or '-'}; задержка: {delay}")
+    return 0
+
+
+COMMANDS = {"conns": cmd_conns, "groups": cmd_groups, "delay": cmd_delay, "health": cmd_health}
 
 
 def main() -> int:
