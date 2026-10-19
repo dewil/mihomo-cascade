@@ -1,0 +1,3 @@
+
+# Synthetic sentinel in black-box health output redaction test; not a credential.
+tests/mihomo-api-health.py:generic-api-key:13
