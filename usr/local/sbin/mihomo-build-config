@@ -49,6 +49,7 @@ LOCAL_RULES = BASE / "local-rules.yaml"
 LOCAL_FALLBACKS = BASE / "cascade-fallbacks.local.json"
 ISO_CODES = BASE / "iso3166_alpha2.txt"
 ALIASES_OUT = BASE / "aliases.yaml"
+ALIAS_LABELS = BASE / "alias-labels.json"
 OUT_CFG = BASE / "config.yaml"
 
 BUILTIN_POLICIES = frozenset(
@@ -481,6 +482,23 @@ def _build_alias_regexes(codes: List[str]) -> Dict[str, str]:
         out[f"{c}3"] = rf"(?i)\b{U}3\b"
         out[f"{c}2"] = rf"(?i)\b{U}2\b"
         out[c] = rf"(?i)\b{U}\b"
+    try:
+        labels = json.loads(ALIAS_LABELS.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return out
+    except (OSError, ValueError):
+        print("Invalid alias-labels.json", file=sys.stderr)
+        raise SystemExit(3) from None
+    if not isinstance(labels, dict) or any(
+        key not in out
+        or not isinstance(value, str)
+        or re.fullmatch(r"[A-Za-z]{2}[0-9]*", value, flags=re.ASCII) is None
+        for key, value in labels.items()
+    ):
+        print("Invalid alias-labels.json", file=sys.stderr)
+        raise SystemExit(3)
+    for key, value in labels.items():
+        out[key] = rf"(?i)\b{re.escape(value)}\b"
     return out
 
 
@@ -824,6 +842,8 @@ def _strip_orphan_listeners(base_text: str, groups: Set[str]) -> str:
 
 
 def main() -> int:
+    codes = _load_iso_codes()
+    aliases = _build_alias_regexes(codes)
     rules_url = _read_routing_rules_url()
     if rules_url:
         if not _download_routing_rules(rules_url):
@@ -850,8 +870,6 @@ def main() -> int:
     proxies.sort(key=lambda p: p["name"])
     _check_node_floor(len(proxies))
     proxy_names = [p["name"] for p in proxies]
-    codes = _load_iso_codes()
-    aliases = _build_alias_regexes(codes)
     assigned = _assign_aliases(proxy_names, aliases)
     fallbacks, probes = _cascade_metadata(aliases, proxy_names)
     gen, groups = _build_generated(proxies, assigned, rules, aliases, fallbacks, probes)
