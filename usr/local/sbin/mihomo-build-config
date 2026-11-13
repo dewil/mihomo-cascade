@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Скачивает подписку, сопоставляет узлы с алиасами (ISO 3166-1 alpha-2: xx, xx2, xx3),
+Скачивает подписку, сопоставляет узлы с алиасами (ISO 3166-1 alpha-2 и номера),
 собирает /etc/mihomo/config.yaml из config.base.yaml + узлы статикой, группы по
 алиасам и правила.
 """
@@ -13,6 +13,7 @@ import pathlib
 import re
 import subprocess
 import sys
+import tempfile
 from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import parse_qs, unquote, urlparse
 
@@ -271,6 +272,11 @@ def _download_routing_rules(url: str) -> bool:
         print("Предупреждение: не удалось скачать правила; проверяю прежний файл.", file=sys.stderr)
         tmp.unlink(missing_ok=True)
         return False
+    try:
+        _reject_unopted_contract(tmp)
+    except SystemExit:
+        tmp.unlink(missing_ok=True)
+        raise
     if not _real_routing_rules(_parse_rules_file(tmp)):
         print(
             "Предупреждение: скачанный ответ не содержит настоящих правил; проверяю прежний файл.",
@@ -468,37 +474,70 @@ def _load_iso_codes() -> List[str]:
         sys.exit(1)
     codes = []
     for ln in ISO_CODES.read_text(encoding="utf-8").splitlines():
-        c = ln.strip().lower()
-        if len(c) == 2 and c.isalpha():
-            codes.append(c)
+        c = ln.strip()
+        if re.fullmatch(r"[A-Za-z]{2}", c):
+            codes.append(c.lower())
     return sorted(set(codes))
 
 
-def _build_alias_regexes(codes: List[str]) -> Dict[str, str]:
-    """Ключи: nl, nl2, nl3. \\b, чтобы HU не матчил 'hub' и т.п."""
-    out: Dict[str, str] = {}
-    for c in codes:
-        U = c.upper()
-        out[f"{c}3"] = rf"(?i)\b{U}3\b"
-        out[f"{c}2"] = rf"(?i)\b{U}2\b"
-        out[c] = rf"(?i)\b{U}\b"
+def _physical_alias(key: str, codes: List[str]) -> bool:
+    return bool(re.fullmatch(r"[a-z]{2}(?:[1-9][0-9]{0,8})?", key)) and key[:2] in codes
+
+
+def _numeric_alias(key: str) -> bool:
+    return key[2:] not in ("", "2", "3")
+
+
+def _alias_tokens(key: str, labels: Dict[str, str]) -> Set[str]:
+    if key in labels:
+        return {labels[key].upper()}
+    tokens = {key.upper()}
+    if _numeric_alias(key):
+        tokens.add(key[:2].upper() + "-" + key[2:])
+    return tokens
+
+
+def _unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate metadata key")
+        result[key] = value
+    return result
+
+
+def _load_alias_labels(codes: List[str]) -> Dict[str, str]:
     try:
-        labels = json.loads(ALIAS_LABELS.read_text(encoding="utf-8"))
+        labels = json.loads(ALIAS_LABELS.read_text(encoding="utf-8"), object_pairs_hook=_unique_object)
     except FileNotFoundError:
-        return out
+        return {}
     except (OSError, ValueError):
         print("Invalid alias-labels.json", file=sys.stderr)
         raise SystemExit(3) from None
     if not isinstance(labels, dict) or any(
-        key not in out
+        not _physical_alias(key, codes)
         or not isinstance(value, str)
-        or re.fullmatch(r"[A-Za-z]{2}[0-9]*", value, flags=re.ASCII) is None
+        or (re.fullmatch(r"[A-Za-z]{2}[0-9]*", value) is None if not _numeric_alias(key)
+            else re.fullmatch(r"[A-Za-z]{2}-?[1-9][0-9]{0,8}", value) is None
+            or value.upper() not in {key.upper(), key[:2].upper() + "-" + key[2:]})
         for key, value in labels.items()
-    ):
+    ) or len({value.upper() for value in labels.values()}) != len(labels):
         print("Invalid alias-labels.json", file=sys.stderr)
         raise SystemExit(3)
+    return labels
+
+
+def _build_alias_regexes(codes: List[str], labels=None) -> Dict[str, str]:
+    """Legacy ISO × 2/3 и явно заданные числовые ключи, без перебора номеров."""
+    if labels is None:
+        labels = _load_alias_labels(codes)
+    out: Dict[str, str] = {}
+    for c in codes:
+        for suffix in ("3", "2", ""):
+            out[c + suffix] = rf"(?i)\b{c.upper()}{suffix}\b"
     for key, value in labels.items():
-        out[key] = rf"(?i)\b{re.escape(value)}\b"
+        out[key] = (rf"\b(?ai:{re.escape(value)})\b" if _numeric_alias(key)
+                    else rf"(?i)\b{re.escape(value)}\b")
     return out
 
 
@@ -512,22 +551,33 @@ def _alias_sort_key(key: str) -> Tuple[str, int]:
 
 
 def _assign_aliases(
-    proxies: List[str], aliases: Dict[str, str]
+    proxies: List[str], aliases: Dict[str, str], explicit: Set[str] | None = None
 ) -> Dict[str, str]:
     """alias_key -> имя прокси из подписки (один узел на алиас максимум)."""
     keys = sorted(aliases.keys(), key=_alias_sort_key)
     used: Set[str] = set()
     assigned: Dict[str, str] = {}
+    explicit = explicit or set()
+    candidates = {alias: [p for p in proxies if re.search(aliases[alias], p)] for alias in keys}
+    if any(sum(p in candidates[alias] for alias in explicit) > 1 for p in proxies):
+        print("Invalid alias assignment: proxy matches multiple physical aliases", file=sys.stderr)
+        raise SystemExit(3)
+    if any(len(candidates[alias]) > 1 for alias in explicit):
+        print("Invalid alias assignment: ambiguous physical alias", file=sys.stderr)
+        raise SystemExit(3)
     for alias in keys:
-        pat = aliases[alias]
-        rx = re.compile(pat)
-        for p in proxies:
-            if p in used:
-                continue
-            if rx.search(p):
-                assigned[alias] = p
-                used.add(p)
-                break
+        if alias in explicit and candidates[alias]:
+            assigned[alias] = candidates[alias][0]
+            used.add(assigned[alias])
+    for alias in keys:
+        if alias in explicit:
+            continue
+        free = [p for p in candidates[alias] if p not in used]
+        if len(free) > 1:
+            print(f"Неоднозначный неявный алиас {alias}: группа пропущена (ambiguous physical alias).", file=sys.stderr)
+        elif free:
+            assigned[alias] = free[0]
+            used.add(free[0])
     return assigned
 
 
@@ -596,22 +646,22 @@ def _load_local_rules() -> List[str]:
 
 
 def _rule_policy(rule: str) -> str | None:
-    if rule.upper().startswith("MATCH"):
+    parts = rule.split(",")
+    if parts[-1].strip() == "no-resolve":
+        parts.pop()
+    if len(parts) < (2 if parts[0].strip().upper() == "MATCH" else 3):
         return None
-    parts = rule.split(",", 2)
-    if len(parts) < 3:
-        return None
-    return parts[2].strip().strip('"').strip("'")
+    return parts[-1].strip().strip("\"'")
 
 
 def _emit_aliases_yaml(aliases: Dict[str, str]) -> None:
     lines = [
-        "# Автогенерация: ISO alpha-2 × варианты 2/3. Редактировать iso3166_alpha2.txt при необходимости.",
+        "# Автогенерация: ISO alpha-2 × варианты 2/3 и явно заданные номера.",
         "",
     ]
     for k in sorted(aliases.keys(), key=_alias_sort_key):
         lines.append(f"{k}:")
-        lines.append(f'    match: "{aliases[k]}"')
+        lines.append(f"    match: {json.dumps(aliases[k])}")
         lines.append("")
     ALIASES_OUT.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
     subprocess.run(["chown", "root:mihomo", str(ALIASES_OUT)], check=False)
@@ -663,16 +713,9 @@ def _check_orphan_policies(orphans: List[str]) -> None:
     )
 
 
-def _cascade_metadata(aliases: Dict[str, str], proxy_names: List[str]):
+def _cascade_metadata(codes: List[str]):
     """Strict inline JSON metadata, delivered atomically with the rules."""
-    def unique_object(pairs):
-        result = {}
-        for key, value in pairs:
-            if key in result:
-                raise ValueError("duplicate metadata key")
-            result[key] = value
-        return result
-
+    claims = set()
     def validate(fallbacks, probes, *, required=False):
         if not isinstance(fallbacks, dict) or (required and not fallbacks):
             raise ValueError("expected nonempty fallback map")
@@ -684,17 +727,11 @@ def _cascade_metadata(aliases: Dict[str, str], proxy_names: List[str]):
                 raise ValueError("expected nonempty reserve list")
             if len(set(reserves)) != len(reserves) or primary in reserves:
                 raise ValueError("duplicate or self reserve")
-            if primary + "-failover" in aliases:
-                raise ValueError("derived policy collision")
             mentioned.update([primary, *reserves])
         for alias in mentioned:
-            if alias not in aliases or alias in BUILTIN_POLICIES:
+            if not _physical_alias(alias, codes):
                 raise ValueError("unknown physical alias")
-            if sum(bool(re.search(aliases[alias], name)) for name in proxy_names) > 1:
-                raise ValueError("ambiguous physical alias")
-        for name in proxy_names:
-            if sum(bool(re.search(aliases[alias], name)) for alias in mentioned) > 1:
-                raise ValueError("proxy matches multiple physical aliases")
+        claims.update(mentioned)
 
     data = {}
     try:
@@ -703,21 +740,24 @@ def _cascade_metadata(aliases: Dict[str, str], proxy_names: List[str]):
                 if line.startswith(key + ":"):
                     if key in data:
                         raise ValueError("duplicate metadata field")
-                    data[key] = json.loads(line.split(":", 1)[1], object_pairs_hook=unique_object)
+                    data[key] = json.loads(line.split(":", 1)[1], object_pairs_hook=_unique_object)
         fallbacks = data.get("cascade-fallbacks", {})
         probes = data.get("cascade-probes", [])
         # A local override must never conceal an invalid central chain.
         validate(fallbacks, probes, required="cascade-fallbacks" in data)
         # lexists also catches dangling symlinks; only an absent file is optional.
         if os.path.lexists(LOCAL_FALLBACKS):
-            local = json.loads(LOCAL_FALLBACKS.read_text(encoding="utf-8"), object_pairs_hook=unique_object)
+            local = json.loads(LOCAL_FALLBACKS.read_text(encoding="utf-8"), object_pairs_hook=_unique_object)
             validate(local, probes, required=True)
             fallbacks = {**fallbacks, **local}
             validate(fallbacks, probes)
-        return fallbacks, set(probes)
+        return fallbacks, set(probes), claims
     except (OSError, UnicodeError):
         print("Cannot read cascade metadata", file=sys.stderr)
         raise SystemExit(3)
+    except json.JSONDecodeError:
+        print("Invalid cascade metadata: invalid JSON", file=sys.stderr)
+        raise SystemExit(3) from None
     except (ValueError, TypeError) as error:
         print("Invalid cascade metadata: " + str(error), file=sys.stderr)
         raise SystemExit(3)
@@ -789,6 +829,9 @@ def _build_generated(
         if pol not in BUILTIN_POLICIES and pol not in assigned and pol not in fallback_groups
     ]
     ordinary_orphans = [pol for pol in orphans if pol not in probes]
+    if any(_numeric_alias(pol) for pol in ordinary_orphans):
+        print("Invalid alias assignment: missing physical alias", file=sys.stderr)
+        raise SystemExit(3)
     if ordinary_orphans:
         # Может не вернуться: при живом предыдущем конфиге выходит с кодом 3.
         _check_orphan_policies(ordinary_orphans)
@@ -811,10 +854,91 @@ def _build_generated(
     return "\n".join(parts) + "\n", groups
 
 
-_LISTENER_PROXY_RE = re.compile(r"^\s*-\s*\{[^}]*\bproxy:\s*([A-Za-z0-9_-]+)\s*\}\s*$")
+_LISTENER_SCALAR = r'''(?:"(?:[^"\\]|\\.)*"|'(?:[^']|'')*'|[^\s"'{}\[\],:#][^{}\[\],#]*?)'''
+_LISTENER_FIELD_RE = re.compile(
+    rf"\s*({_LISTENER_SCALAR})\s*:\s*({_LISTENER_SCALAR})?\s*([,}}])"
+)
 
 
-def _strip_orphan_listeners(base_text: str, groups: Set[str]) -> str:
+def _listener_proxy(line: str) -> str | None:
+    """Read a flat, single-line listener mapping; fail closed on proxy errors."""
+    proxy = None
+    seen_proxy = False
+
+    def scalar(value: str, decode: bool = True) -> str:
+        value = value.strip()
+        if not decode and value.startswith(('"', "'")):
+            return value  # The field regex already checked the quoted boundaries.
+        if value.startswith('"'):
+            escapes = {
+                '0': '\0', 'a': '\a', 'b': '\b', 't': '\t', '\t': '\t',
+                'n': '\n', 'v': '\v', 'f': '\f', 'r': '\r', 'e': '\x1b',
+                ' ': ' ', '"': '"', '/': '/', '\\': '\\',
+                'N': '\x85', '_': '\xa0', 'L': '\u2028', 'P': '\u2029',
+            }
+            decoded = []
+            pos = 1
+            end = len(value) - 1
+            while pos < end:
+                char = value[pos]
+                pos += 1
+                if char == '\\':
+                    if pos >= end:
+                        raise ValueError
+                    char = value[pos]
+                    pos += 1
+                    if char in escapes:
+                        char = escapes[char]
+                    elif char in ('x', 'u', 'U'):
+                        size = {'x': 2, 'u': 4, 'U': 8}[char]
+                        digits = value[pos:pos + size]
+                        if len(digits) != size or not re.fullmatch(r'[0-9a-fA-F]+', digits):
+                            raise ValueError
+                        codepoint = int(digits, 16)
+                        if codepoint > 0x10FFFF or 0xD800 <= codepoint <= 0xDFFF:
+                            raise ValueError
+                        char = chr(codepoint)
+                        pos += size
+                    else:
+                        raise ValueError
+                decoded.append(char)
+            return ''.join(decoded)
+        if value.startswith("'"):
+            return value[1:-1].replace("''", "'")
+        if re.search(r":(?:\s|$)", value):
+            raise ValueError
+        return value
+
+    try:
+        start = re.match(r"\s*-\s*\{", line)
+        if not start:
+            raise ValueError
+        pos = start.end()
+        while True:
+            if re.fullmatch(r"\s*}\s*(?:#.*)?", line[pos:]):
+                break
+            field = _LISTENER_FIELD_RE.match(line, pos)
+            if not field:
+                raise ValueError
+            key = scalar(field.group(1))
+            if key == "proxy":
+                if seen_proxy:
+                    raise ValueError
+                seen_proxy = True
+            value = scalar(field.group(2) or "", decode=key == "proxy")
+            if key == "proxy":
+                proxy = value
+            pos = field.end()
+            if field.group(3) == "}":
+                if not re.fullmatch(r"\s*(?:#.*)?", line[pos:]):
+                    raise ValueError
+                break
+    except ValueError:
+        raise ValueError from None
+    return proxy
+
+
+def _strip_orphan_listeners(base_text: str, groups: Set[str], codes: List[str] | None) -> str:
     """Выкинуть листенеры, чьей группы в этой сборке нет.
 
     Листенеры живут в статическом config.base.yaml, а группы генерятся из
@@ -825,11 +949,32 @@ def _strip_orphan_listeners(base_text: str, groups: Set[str]) -> str:
     """
     kept: List[str] = []
     dropped: List[str] = []
+    in_listeners = False
+    sequence_indent = None
     for line in base_text.splitlines():
-        m = _LISTENER_PROXY_RE.match(line)
-        if m and m.group(1) not in groups and m.group(1) not in BUILTIN_POLICIES:
-            dropped.append(m.group(1))
+        if line and not line[0].isspace() and not line.startswith(("#", "-")):
+            in_listeners = bool(re.fullmatch(r"listeners:\s*(?:#.*)?", line))
+            sequence_indent = None
+            kept.append(line)
             continue
+        item = re.match(r"( *)-(?:\s|$)", line) if in_listeners else None
+        if item and sequence_indent is None:
+            sequence_indent = len(item.group(1))
+        # Only direct flow items are parsed; block contents remain opaque.
+        if item and len(item.group(1)) == sequence_indent and re.match(r"\s*-\s*\{", line):
+            try:
+                proxy = _listener_proxy(line)
+                if proxy is not None:
+                    physical = proxy.removesuffix("-failover")
+                    if codes is not None and proxy not in BUILTIN_POLICIES and not _physical_alias(physical, codes):
+                        raise ValueError
+            except ValueError:
+                print("Invalid alias assignment: invalid listener proxy", file=sys.stderr)
+                raise SystemExit(3) from None
+            if proxy is not None and proxy not in groups and proxy not in BUILTIN_POLICIES:
+                dropped.append(proxy if codes is not None or re.fullmatch(r"[a-z][a-z0-9-]{0,63}", proxy)
+                               else "<unknown-group>")
+                continue
         kept.append(line)
     if dropped:
         print(
@@ -841,18 +986,548 @@ def _strip_orphan_listeners(base_text: str, groups: Set[str]) -> str:
     return "\n".join(kept)
 
 
+class _CascadeContractError(ValueError):
+    """Only fixed, public reasons may cross the v3 diagnostic boundary."""
+
+
+_V3_BUILTIN_POLICIES = BUILTIN_POLICIES - {"PROXY"}
+
+
+def _contract_message(error: _CascadeContractError) -> str:
+    reason = str(error)
+    return reason if reason == "Unsupported cascade contract" else "Invalid cascade contract: " + reason
+
+
+def _contract_header(path: pathlib.Path) -> str | None:
+    # Detection must not introduce new errors/diagnostics on legacy inputs.
+    if not path.is_file():
+        return None
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    for line in text.splitlines():
+        if line.startswith("cascade-contract:"):
+            return line.split(":", 1)[1]
+    return None
+
+
+def _reject_unopted_contract(path: pathlib.Path) -> None:
+    header = _contract_header(path)
+    if header is None:
+        return
+    try:
+        version = json.loads(header)
+    except ValueError:
+        version = None
+    reason = ("Invalid cascade contract: v3 rules require opt-in"
+              if type(version) is int and version == 3 else "Unsupported cascade contract")
+    print(reason, file=sys.stderr)
+    raise SystemExit(3)
+
+
+def _parse_v3_rules_file(path: pathlib.Path) -> List[str]:
+    """Read the rules subset with v3 scalar decoding; keep legacy parsing frozen."""
+    if not path.is_file():
+        return []
+    rules = []
+    in_rules = False
+    rules_indent = 0
+    for line in path.read_text(encoding="utf-8").splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip())
+        if not in_rules:
+            if s.startswith("rules:"):
+                in_rules = True
+                rules_indent = indent
+            continue
+        if indent <= rules_indent and not s.startswith("- "):
+            break
+        if not s.startswith("- "):
+            continue
+        rule = s[2:].strip()
+        if rule.startswith(('"', "'")):
+            quoted = re.fullmatch(r"""("(?:\\.|[^"\\])*"|'(?:''|[^'])*')(?:\s+#.*)?""", rule)
+            if not quoted:
+                raise _CascadeContractError("bad rule escape")
+            scalar = quoted[1]
+            if scalar.startswith('"'):
+                try:
+                    rule = json.loads(scalar)
+                except ValueError:
+                    raise _CascadeContractError("bad rule escape") from None
+            else:
+                rule = scalar[1:-1].replace("''", "'")
+        else:
+            rule = re.split(r"\s+#", rule, maxsplit=1)[0].rstrip()
+        if rule:
+            rules.append(rule)
+    return rules
+
+
+def _validate_v3(path: pathlib.Path, *, local_rules=(), target=None, generation=0):
+    """Validate the complete document before accepting a downloaded rules file.
+
+    Also used by the offline projector; no router files are read implicitly.
+    """
+    def invalid(reason):
+        raise _CascadeContractError(reason)
+
+    def load_json(raw):
+        try:
+            return json.loads(raw, object_pairs_hook=_unique_object)
+        except ValueError:
+            invalid("invalid or duplicate JSON")
+
+    lines = path.read_text(encoding="utf-8").splitlines()
+    significant = [line for line in lines if line.strip() and not line.lstrip().startswith("#")]
+    headers = [line for line in significant if line.startswith("cascade-contract:")]
+    if not headers:
+        invalid("opt-in requires contract 3")
+    version = load_json(headers[0].split(":", 1)[1])
+    if type(version) is not int or version != 3:
+        invalid("Unsupported cascade contract")
+    if significant[0] != headers[0]:
+        invalid("contract header must be first")
+    allowed = {"cascade-contract", "cascade-generation", "cascade-target",
+               "cascade-nodes", "cascade-services", "cascade-probes"}
+    data = {}
+    for line in significant:
+        if not line.lstrip().startswith("cascade-"):
+            continue
+        field = re.fullmatch(r"(cascade-[a-z-]+):\s*(.*)", line)
+        if not field or field[1] not in allowed:
+            invalid("unknown or indented metadata")
+        key = field[1]
+        if key in data:
+            invalid("duplicate metadata field")
+        data[key] = load_json(field[2])
+
+    current = data.get("cascade-generation")
+    if type(current) is not int or current < 1:
+        invalid("invalid generation")
+    if current < generation:
+        invalid("stale generation")
+    if "cascade-target" in data and (not isinstance(data["cascade-target"], str)
+            or not re.fullmatch(r"[a-z0-9-]{1,64}", data["cascade-target"])):
+        invalid("invalid target")
+    if target is not None and data.get("cascade-target") != target:
+        invalid("target mismatch")
+
+    nodes = data.get("cascade-nodes")
+    if not isinstance(nodes, dict) or not nodes:
+        invalid("expected nonempty nodes")
+    selectors = set()
+    for node, selector in nodes.items():
+        if not re.fullmatch(r"[a-z][a-z0-9-]{0,31}", node):
+            invalid("invalid node ID")
+        if not isinstance(selector, dict) or set(selector) - {"server", "port"}:
+            invalid("invalid node selector")
+        server = selector.get("server")
+        if not isinstance(server, str) or not server or re.search(r"\s", server):
+            invalid("invalid server")
+        port = selector.get("port")
+        if "port" in selector and (type(port) is not int or not 1 <= port <= 65535):
+            invalid("invalid port")
+        pair = (server.lower(), port)
+        if pair in selectors:
+            invalid("duplicate node selector")
+        selectors.add(pair)
+
+    def node_list(items, *, nonempty=False):
+        if not isinstance(items, list) or (nonempty and not items):
+            invalid("expected node list")
+        if any(not isinstance(node, str) or node not in nodes for node in items):
+            invalid("unknown node ID")
+        if len(set(items)) != len(items):
+            invalid("duplicate node ID")
+
+    services = data.get("cascade-services")
+    if not isinstance(services, dict) or not services:
+        invalid("expected nonempty services")
+    for name, items in services.items():
+        if not re.fullmatch(r"svc-[a-z0-9-]{1,48}", name):
+            invalid("invalid service name")
+        node_list(items, nonempty=True)
+    probes = data.get("cascade-probes", [])
+    node_list(probes)
+    rules = _parse_v3_rules_file(path)
+    if not _real_routing_rules(rules):
+        invalid("missing real routing rules")
+    policies = _V3_BUILTIN_POLICIES | services.keys() | {"node-" + node for node in probes}
+    for rule in [*local_rules, *rules]:
+        if _rule_policy(rule) not in policies:
+            invalid("unknown policy")
+    return data, [*local_rules, *rules]
+
+
+def _strip_v3_orphan_listeners(base_text: str, groups: Set[str]) -> str:
+    """Filter whole block/flow listener items without changing the legacy parser."""
+    kept = []
+    block = []
+    in_listeners = False
+    sequence_indent = None
+
+    def flush():
+        if not block:
+            return
+        head = re.match(r"\s*-\s*(.*)", block[0])[1]
+        fields = {}
+        if head.startswith("{"):
+            # Validate the complete flow mapping with the existing scalar parser.
+            _listener_proxy(block[0])
+            raw_fields = []
+            pos = 1
+            while not re.fullmatch(r"\s*}\s*(?:#.*)?", head[pos:]):
+                field = _LISTENER_FIELD_RE.match(head, pos)
+                raw_fields.append((field[1], field[2] or ""))
+                pos = field.end()
+                if field[3] == "}":
+                    break
+        else:
+            raw_fields = []
+            field_indent = len(block[0]) - len(head)
+            if not head or head.startswith("#"):
+                field_indent = next((len(line) - len(line.lstrip()) for line in block[1:]
+                                     if line.strip() and not line.lstrip().startswith("#")),
+                                    sequence_indent + 2)
+            lines = [head, *(line[field_indent:] for line in block[1:]
+                            if re.match(rf" {{{field_indent}}}\S", line))]
+            for line in lines:
+                field = re.fullmatch(
+                    rf"({_LISTENER_SCALAR})\s*:\s*({_LISTENER_SCALAR})?\s*(?:#.*)?", line)
+                if field:
+                    raw_fields.append((field[1], field[2] or ""))
+        for key, value in raw_fields:
+            key = _listener_proxy("- {proxy: " + key + "}")
+            if key in {"name", "proxy"}:
+                if key in fields:
+                    raise _CascadeContractError("duplicate listener field")
+                fields[key] = _listener_proxy("- {proxy: " + value + "}")
+        proxy = fields.get("proxy")
+        if proxy is not None and proxy not in groups and proxy not in _V3_BUILTIN_POLICIES:
+            print(f"cascade v3: listener {fields.get('name', '<unnamed>')} dropped: "
+                  f"unknown proxy {proxy}", file=sys.stderr)
+        else:
+            kept.extend(block)
+        block.clear()
+
+    for line in base_text.splitlines():
+        if line and not line[0].isspace() and not line.startswith(("#", "-")):
+            flush()
+            # Decode the mapping key as a YAML scalar, including quoted escapes.
+            # Keep its original spelling in the output, as with listener fields.
+            field = re.fullmatch(rf"({_LISTENER_SCALAR})\s*:\s*(.*)", line)
+            value = None
+            if field and _listener_proxy("- {proxy: " + field[1] + "}") == "listeners":
+                value = field[2]
+            if value is not None and value.startswith("["):
+                # Keep supported inline lists verbatim; unlike block items,
+                # an unknown proxy rejects the whole build (T16).
+                mapping = r'''\{(?:"(?:[^"\\]|\\.)*"|'(?:[^']|'')*'|[^{}"'])*\}'''
+                try:
+                    body = re.fullmatch(
+                        rf"\[\s*((?:{mapping}(?:\s*,\s*{mapping})*\s*,?\s*)?)\]\s*(?:#.*)?",
+                        value)
+                    if body is None:
+                        raise ValueError
+                    for item in re.finditer(mapping, body[1]):
+                        proxy = _listener_proxy("- " + item[0])
+                        if proxy is not None and proxy not in groups and proxy not in _V3_BUILTIN_POLICIES:
+                            raise ValueError
+                except ValueError:
+                    raise _CascadeContractError("unsupported inline listeners") from None
+            in_listeners = value is not None and (not value or value.startswith("#"))
+            sequence_indent = None
+            kept.append(line)
+            continue
+        item = re.match(r"( *)-(?:\s|$)", line) if in_listeners else None
+        if item and sequence_indent is None:
+            sequence_indent = len(item[1])
+        if item and len(item[1]) == sequence_indent:
+            flush()
+            block.append(line)
+        elif block:
+            block.append(line)
+        else:
+            kept.append(line)
+    flush()
+    base = "\n".join(kept)
+    # T19: guard the final base, including references outside parsed listeners.
+    reference = re.compile(r'''(?:^|[\s{,])["']?proxy["']?\s*:\s*'''
+                           + rf"({_LISTENER_SCALAR})(?=\s*(?:[,}}\]#]|$))")
+    quoted_scalar = re.compile(r""""(?:[^"\\]|\\.)*"|'(?:[^']|'')*'""")
+    flow_depth = 0
+    for line in base.splitlines():
+        # T22/T23: quotes only open a scalar at a YAML token boundary.
+        # Whitespace inside a plain scalar does not start another token.
+        plain = False
+        pos = 0
+        while pos < len(line):
+            char = line[pos]
+            following = line[pos + 1:pos + 2]
+            if char == "#" and (pos == 0 or line[pos - 1] in " \t"):
+                line = line[:pos]
+                break
+            if char in " \t":
+                pos += 1
+                continue
+            if not plain and char in "\"'":
+                token = quoted_scalar.match(line, pos)
+                if token:
+                    pos = token.end()
+                    continue
+            if not plain and char in "[{":
+                flow_depth += 1
+            elif flow_depth and char in "]}":
+                flow_depth -= 1
+            elif flow_depth and char == ",":
+                pass
+            elif char == ":" and (not following or following in " \t"
+                                  or (flow_depth and (not plain or following in "[]{},"))):
+                pass
+            elif not plain and char == "-" and (not following or following in " \t"):
+                pass
+            else:
+                plain = True
+                pos += 1
+                continue
+            plain = False
+            pos += 1
+        for match in reference.finditer(line):
+            try:
+                proxy = _listener_proxy("- {proxy: " + match[1] + "}")
+                if proxy in groups or proxy in _V3_BUILTIN_POLICIES:
+                    continue
+            except ValueError:
+                pass
+            raise _CascadeContractError("unknown proxy reference in base config")
+    return base
+
+
+def _v3_fetch(url: str, tmp: pathlib.Path, *, subscription=False) -> None:
+    # Curl diagnostics and CalledProcessError include the URL; never expose them.
+    subprocess.run(["curl", "-fsSL", "--noproxy", "*", "--connect-timeout",
+                    "20" if subscription else "15", "--max-time",
+                    "120" if subscription else "60", "-o", str(tmp), url],
+                   check=True, stderr=subprocess.DEVNULL)
+
+
+def _build_v3(proxies, data, rules):
+    nodes = data["cascade-nodes"]
+    members = {node: [] for node in nodes}
+    for proxy in proxies:
+        matched = [node for node, selector in nodes.items()
+                   if selector["server"].lower() == proxy["server"].lower()
+                   and ("port" not in selector or selector["port"] == proxy["port"])]
+        if len(matched) > 1:
+            raise _CascadeContractError("overlapping node selectors")
+        if matched:
+            members[matched[0]].append(proxy["name"])
+    for node in sorted(nodes):
+        if not members[node]:
+            print(f"cascade v3: node {node} missing from subscription", file=sys.stderr)
+    blocks = []
+    groups = set()
+
+    def emit(name, names, *, probe=False):
+        groups.add(name)
+        if not names:
+            kind, health, names = "select", "", ["REJECT"]
+            if not probe:
+                print(f"cascade v3: service {name} has no available node, REJECT", file=sys.stderr)
+        else:
+            kind = "url-test" if probe else "fallback"
+            health = "    url: https://www.gstatic.com/generate_204\n"
+            health += ("    interval: 600\n" if probe else
+                       "    interval: 30\n    timeout: 5000\n    lazy: false\n")
+        blocks.append(f"  - name: {name}\n    type: {kind}\n" + health + "    proxies:\n"
+                      + "".join("      - " + json.dumps(n, ensure_ascii=False) + "\n" for n in names))
+
+    for service, ids in sorted(data["cascade-services"].items()):
+        emit(service, [name for node in ids for name in members[node]])
+    for node in sorted(data.get("cascade-probes", [])):
+        emit("node-" + node, members[node], probe=True)
+
+    def quote_rule(rule):
+        # YAML treats literal NEL as a line break and forbids most C1 controls.
+        return re.sub(r"[\x7f-\x9f\u2028\u2029]",
+                      lambda match: f"\\u{ord(match[0]):04x}",
+                      json.dumps(rule, ensure_ascii=False))
+
+    generated = (_dump_clash_proxies(proxies) + "\nproxy-groups:\n" + "\n".join(blocks)
+                 + "\nrules:\n" + "".join("  - " + quote_rule(r) + "\n" for r in rules))
+    return generated, groups
+
+
+def _publish_v3(config: str, state: str, rules: pathlib.Path | None = None) -> None:
+    """Commit state before config, then downloaded rules; roll back on write errors.
+
+    Individual replaces are atomic. An interruption can leave state ahead of
+    config; retrying the same generation is allowed by the v3 validator.
+    """
+    pending = STATE_FILE.with_name(STATE_FILE.name + ".new")
+    directory = None
+    backups = {}
+    committed = []
+    published = False
+    step = "state"
+    try:
+        directory = tempfile.TemporaryDirectory(prefix=".v3-", dir=BASE)
+        pending.write_text(state, encoding="utf-8")
+        subprocess.run(["chown", "root:mihomo", str(pending)], check=False)
+        subprocess.run(["chmod", "640", str(pending)], check=False)
+        for step, path in (("state", STATE_FILE), ("config", OUT_CFG)):
+            backup = pathlib.Path(directory.name) / path.name if path.is_file() else None
+            if backup is not None:
+                os.link(path, backup)
+            backups[path] = backup
+        step = "state"
+        pending.replace(STATE_FILE)
+        committed.append(STATE_FILE)
+        step = "config"
+        if _write_if_changed(OUT_CFG, config):
+            committed.append(OUT_CFG)
+        if rules is not None:
+            step = "rules"
+            rules.replace(ROUTING_RULES)
+        published = True
+    except (OSError, ValueError, TypeError):
+        for path in reversed(committed):
+            if backups[path] is not None:
+                backups[path].replace(path)
+            else:
+                path.unlink(missing_ok=True)
+        print(f"cascade v3: publish failed at {step}, rolled back", file=sys.stderr)
+        raise
+    finally:
+        pending.unlink(missing_ok=True)
+        OUT_CFG.with_name(OUT_CFG.name + ".new").unlink(missing_ok=True)
+        if directory is not None:
+            try:
+                directory.cleanup()
+            except OSError:
+                if not published:
+                    raise
+                print("cascade v3: temp cleanup failed", file=sys.stderr)
+
+
+def _main_v3() -> int:
+    tmp = ROUTING_RULES.with_suffix(".yaml.tmp")
+    sub_tmp = BASE / ".subscription.raw.tmp"
+    try:
+        if (BASE / "cascade-contract").read_text(encoding="utf-8").strip() != "3":
+            raise _CascadeContractError("Unsupported cascade contract")
+        target_path = BASE / "cascade-target"
+        target = target_path.read_text(encoding="utf-8").strip() if os.path.lexists(target_path) else None
+        generation = 0
+        if STATE_FILE.is_file():
+            try:
+                previous = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+                if previous.get("contract") == 3 and type(previous.get("generation")) is int:
+                    generation = previous["generation"]
+            except (ValueError, AttributeError):
+                pass  # Same corrupt-state recovery as the existing node floor.
+        local_rules = _parse_v3_rules_file(LOCAL_RULES)
+        validation = dict(local_rules=local_rules, target=target, generation=generation)
+        rules_url = _read_routing_rules_url()
+        rules_path = ROUTING_RULES
+        if rules_url:
+            try:
+                _v3_fetch(rules_url, tmp)
+                _validate_v3(tmp, **validation)
+            except _CascadeContractError as error:
+                print("Предупреждение: " + _contract_message(error) + "; проверяю прежний файл.", file=sys.stderr)
+            except (OSError, UnicodeError, subprocess.CalledProcessError):
+                print("Предупреждение: не удалось получить правила; проверяю прежний файл.", file=sys.stderr)
+            else:
+                rules_path = tmp
+        data, rules = _validate_v3(rules_path, **validation)
+        try:
+            _v3_fetch(_read_subscription_url(), sub_tmp, subscription=True)
+        except (OSError, subprocess.CalledProcessError):
+            raise _CascadeContractError("cannot download subscription") from None
+        proxies = _decode_subscription_proxies(sub_tmp.read_bytes())
+        if not proxies:
+            raise _CascadeContractError("subscription contains no vless proxies")
+        reserved = {name.lower() for name in BUILTIN_POLICIES | data["cascade-services"].keys()
+                    | {"node-" + node for node in data.get("cascade-probes", [])}}
+        safe_proxies = []
+        for proxy in proxies:
+            if proxy["name"].lower() in reserved:
+                print("cascade v3: proxy name collides with policy, skipped", file=sys.stderr)
+            else:
+                safe_proxies.append(proxy)
+        proxies = safe_proxies
+        proxies.sort(key=lambda p: p["name"])
+        _check_node_floor(len(proxies))
+        generated, groups = _build_v3(proxies, data, rules)
+        base = _strip_v3_orphan_listeners(BASE_CFG.read_text(encoding="utf-8"), groups)
+        state = json.dumps({"node_count": len(proxies), "contract": 3,
+                            "generation": data["cascade-generation"]}) + "\n"
+        _publish_v3(base.rstrip() + "\n\n" + generated, state,
+                    rules=tmp if rules_path == tmp else None)
+        return 0
+    except _CascadeContractError as error:
+        print(_contract_message(error), file=sys.stderr)
+        return 3
+    except (OSError, UnicodeError, ValueError, TypeError):
+        print("Invalid cascade contract: cannot read or build v3 configuration", file=sys.stderr)
+        return 3
+    finally:
+        tmp.unlink(missing_ok=True)
+        sub_tmp.unlink(missing_ok=True)
+
+
 def main() -> int:
+    if os.path.lexists(BASE / "cascade-contract"):
+        return _main_v3()
+    rules_ready = False
+    if _contract_header(ROUTING_RULES) is not None:
+        # Opt-out can replace cached v3 rules with the restored legacy URL.
+        # Otherwise refuse before consulting any legacy-only alias files.
+        rules_url = _read_routing_rules_url()
+        if rules_url:
+            _download_routing_rules(rules_url)
+        _reject_unopted_contract(ROUTING_RULES)
+        rules_ready = True
     codes = _load_iso_codes()
-    aliases = _build_alias_regexes(codes)
-    rules_url = _read_routing_rules_url()
+    labels = _load_alias_labels(codes)
+    aliases = _build_alias_regexes(codes, labels)
+    rules_url = None if rules_ready else _read_routing_rules_url()
     if rules_url:
         if not _download_routing_rules(rules_url):
             print(
                 "Прежние правила используются только при наличии настоящей настройки.",
                 file=sys.stderr,
             )
+    _reject_unopted_contract(ROUTING_RULES)
     rules = _load_routing_rules()
     rules = _load_local_rules() + rules
+    fallbacks, probes, metadata_claims = _cascade_metadata(codes)
+    explicit = metadata_claims | set(labels)
+    for rule in rules:
+        policy = _rule_policy(rule)
+        if not policy or policy in BUILTIN_POLICIES:
+            continue
+        if policy.endswith("-failover") and policy.removesuffix("-failover") in fallbacks:
+            explicit.add(policy.removesuffix("-failover"))
+        elif _physical_alias(policy, codes):
+            explicit.add(policy)
+        else:
+            print("Invalid alias assignment: unknown physical alias", file=sys.stderr)
+            raise SystemExit(3)
+    tokens = set()
+    for alias in sorted(explicit):
+        effective = _alias_tokens(alias, labels)
+        if tokens & effective:
+            print("Invalid alias assignment: conflicting alias labels", file=sys.stderr)
+            raise SystemExit(3)
+        tokens.update(effective)
+        if alias not in aliases:
+            aliases[alias] = rf"\b(?ai:{alias[:2].upper()})-?{alias[2:]}\b"
     url = _read_subscription_url()
     raw = _download_subscription(url)
     proxies = _decode_subscription_proxies(raw)
@@ -864,17 +1539,17 @@ def main() -> int:
         )
         sys.exit(1)
     # Агрегатор временами отдает те же узлы в другом порядке. Без сортировки
-    # конфиг менялся бы на ровном месте (а значит и лишний reload), плюс раздача
-    # алиасов ниже берет ПЕРВОЕ совпадение - то есть от порядка зависела бы еще
-    # и привязка алиаса к узлу.
+    # конфиг менялся бы на ровном месте (а значит и лишний reload).
     proxies.sort(key=lambda p: p["name"])
     _check_node_floor(len(proxies))
     proxy_names = [p["name"] for p in proxies]
-    assigned = _assign_aliases(proxy_names, aliases)
-    fallbacks, probes = _cascade_metadata(aliases, proxy_names)
+    assigned = _assign_aliases(proxy_names, aliases, explicit)
+    if any(_numeric_alias(alias) and alias not in assigned for alias in labels.keys() - metadata_claims):
+        print("Invalid alias assignment: missing physical alias", file=sys.stderr)
+        raise SystemExit(3)
     gen, groups = _build_generated(proxies, assigned, rules, aliases, fallbacks, probes)
 
-    base = _strip_orphan_listeners(BASE_CFG.read_text(encoding="utf-8"), groups)
+    base = _strip_orphan_listeners(BASE_CFG.read_text(encoding="utf-8"), groups, codes)
     base = base.rstrip() + "\n\n"
     _emit_aliases_yaml(aliases)
     _write_if_changed(OUT_CFG, base + gen)
