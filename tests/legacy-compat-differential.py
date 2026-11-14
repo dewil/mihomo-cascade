@@ -14,7 +14,9 @@ routing-rules.yaml (no routing-rules.url). Compared: exit code and the bytes of 
 file under MIHOMO_BASE (inputs included: an unchanged input must stay unchanged, and
 any created/modified output must match). stdout/stderr text is NOT compared.
 Normalization: (1) the per-sandbox temp path is replaced by <SANDBOX> in file contents
-(subscription.url contains it; harness artifact). (2) Otherwise none by default. If both runs of the *same* reference builder differ
+(subscription.url contains it; harness artifact). (2) aliases.yaml is NOT compared byte-wise (spec 'Уточнения после сверки': the reference
+writes a backspace in the regex, a known bug fixed by the new builder); only the set of
+alias names must equal the reference. (3) Otherwise none by default. If both runs of the *same* reference builder differ
 from each other (inherent nondeterminism), the differing lines are located by the
 self-check below and masked as `<VOLATILE>` for that file; a case reports this.
 Needs no network, no root, no PyYAML. V3 mode = file `cascade-contract` in MIHOMO_BASE.
@@ -122,13 +124,24 @@ def scenario(ref, sub, rules, contract=None, seed=None, extra=None, builders=Non
     return res
 
 
+def alias_names(raw):
+    """Alias names in aliases.yaml: top-level keys, i.e. non-indented, non-comment lines
+    of the form `name:` (format seen in the reference output: `ad3:` then an indented
+    `match:` line). Duplicates collapse into a set."""
+    return {m.group(1) for m in re.finditer(r'^([^\s#][^:\n]*):[ \t]*$',
+                                            raw.decode('utf-8', 'replace'), re.M)}
+
+
 def diff_reason(a, b):
     if a[0] != b[0]:
         return f'exit code ref={a[0]} new={b[0]}'
     ka, kb = set(a[1]), set(b[1])
     if ka != kb:
         return f'file set differs: only ref {sorted(ka - kb)}, only new {sorted(kb - ka)}'
-    bad = [k for k in sorted(ka) if a[1][k] != b[1][k]]
+    bad = [k for k in sorted(ka) if k != 'aliases.yaml' and a[1][k] != b[1][k]]
+    if 'aliases.yaml' in ka and alias_names(a[1]['aliases.yaml']) != alias_names(b[1]['aliases.yaml']):
+        na, nb = alias_names(a[1]['aliases.yaml']), alias_names(b[1]['aliases.yaml'])
+        bad.append(f'aliases.yaml names (only ref {sorted(na - nb)[:5]}, only new {sorted(nb - na)[:5]})')
     return f'content differs in {", ".join(bad)}' if bad else None
 
 
