@@ -268,6 +268,42 @@ def v3_cases(ref, prefix=''):
          sub_text(names_for(ALL)), TYPICAL_RULES, contract='3\n')
 
 
+# ------------------------------------------------------------ FR-LC-06
+def groups_case(name, sub, rules, expect_groups):
+    """New builder alone: rc must be 0 and config.yaml must contain a proxy-group
+    (line `  - name: <alias>`) for every alias in expect_groups."""
+    try:
+        (rc, files), = scenario(None, sub, rules, None, None, None, [BUILDER])
+        cfg = files.get('config.yaml', b'').decode('utf-8', 'replace')
+        have = set(re.findall(r'^  - name: "?([^"\n]+?)"?\s*$', cfg, re.M))
+        missing = [g for g in expect_groups if g not in have]
+        why = f'rc={rc}, want 0' if rc != 0 else (f'no proxy-group for {missing}' if missing else None)
+    except Exception as e:
+        why = f'harness error: {e!r}'
+    if why:
+        FAILS.append(name)
+    print(('FAIL ' if why else 'PASS ') + name + (f' - {why}' if why else ''), flush=True)
+
+
+def numbered_cases(r7):
+    sub = sub_text(['DE5 de5 node', 'DE3 de3 node', 'PL pl node'])
+    case('FR-LC-06a numbered alias de5 alone (== r7)', r7, sub,
+         rules_text(['DOMAIN-SUFFIX,a.example,de5', 'MATCH,DIRECT']))
+    v2 = rules_text(['DOMAIN-SUFFIX,a.example,de3-failover',
+                     'DOMAIN-SUFFIX,b.example,de5-failover',
+                     'DOMAIN-SUFFIX,c.example,pl-failover', 'MATCH,DIRECT'],
+                    'cascade-fallbacks: {"de3":["de5"],"de5":["de3"],"pl":["de3"]}\n')
+    case('FR-LC-06b de5 with v2 fallbacks, real shape (== r7)', r7, sub, v2)
+    groups_case('FR-LC-06c de5 + non-alias policy: rc=0, groups for aliases', sub,
+                rules_text(['DOMAIN-SUFFIX,a.example,de5', 'DOMAIN-SUFFIX,t.me,Telegram',
+                            'DOMAIN-SUFFIX,c.example,pl', 'MATCH,DIRECT']), ['de5', 'pl'])
+    amb = sub_text(['DE5 de5 node', 'DE de3 node', 'DE de3 backup node', 'PL pl node'])
+    groups_case('FR-LC-06d de5 + ambiguous alias used in rules: rc=0, groups', amb,
+                rules_text(['DOMAIN-SUFFIX,a.example,de5', 'DOMAIN-SUFFIX,b.example,de3',
+                            'DOMAIN-SUFFIX,c.example,pl', 'MATCH,DIRECT']),
+                ['de5', 'de3', 'pl'])
+
+
 # ------------------------------------------------------------ FR-LC-03 real
 def real_aliases(text, v3):
     pols, aliases = set(), set()
@@ -300,7 +336,9 @@ def real_cases(ref_legacy, ref_v3, d):
             continue
         text = p.read_text()
         names = [f'{a.upper()} {a} node' for a in real_aliases(text, v3)] or ['DE de node']
-        case(f'FR-LC-03 real {fname}', ref_v3 if v3 else ref_legacy, sub_text(names), text,
+        # Real rules use numbered aliases (de5) unknown to 6b8a52d: per spec clarification
+        # (FR-LC-06) rules.yaml / rules-v2.yaml are compared with r7, not with 6b8a52d.
+        case(f'FR-LC-03 real {fname}', ref_v3, sub_text(names), text,
              contract='3\n' if v3 else None)
 
 
@@ -371,6 +409,7 @@ def main():
         ref_legacy, ref_v3 = git_show(LEGACY_REV), git_show(V3_REV)
         legacy_cases(ref_legacy)
         v3_cases(ref_v3)
+        numbered_cases(ref_v3)
         if args.real_rules_dir:
             real_cases(ref_legacy, ref_v3, args.real_rules_dir)
         helpers_case(ref_v3)
