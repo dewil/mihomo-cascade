@@ -507,22 +507,24 @@ def _unique_object(pairs):
     return result
 
 
-def _load_alias_labels(codes: List[str]) -> Dict[str, str]:
+def _load_alias_labels(codes: List[str], *, legacy=False) -> Dict[str, str]:
     try:
-        labels = json.loads(ALIAS_LABELS.read_text(encoding="utf-8"), object_pairs_hook=_unique_object)
+        labels = json.loads(ALIAS_LABELS.read_text(encoding="utf-8"),
+                            object_pairs_hook=None if legacy else _unique_object)
     except FileNotFoundError:
         return {}
     except (OSError, ValueError):
         print("Invalid alias-labels.json", file=sys.stderr)
         raise SystemExit(3) from None
+    legacy_keys = {code + suffix for code in codes for suffix in ("", "2", "3")}
     if not isinstance(labels, dict) or any(
-        not _physical_alias(key, codes)
+        not (_physical_alias(key, codes) or (legacy and key in legacy_keys))
         or not isinstance(value, str)
         or (re.fullmatch(r"[A-Za-z]{2}[0-9]*", value) is None if not _numeric_alias(key)
             else re.fullmatch(r"[A-Za-z]{2}-?[1-9][0-9]{0,8}", value) is None
             or value.upper() not in {key.upper(), key[:2].upper() + "-" + key[2:]})
         for key, value in labels.items()
-    ) or len({value.upper() for value in labels.values()}) != len(labels):
+    ) or (not legacy and len({value.upper() for value in labels.values()}) != len(labels)):
         print("Invalid alias-labels.json", file=sys.stderr)
         raise SystemExit(3)
     return labels
@@ -1520,13 +1522,24 @@ def _legacy_build_alias_regexes(codes: List[str]) -> Dict[str, str]:
 
 
 def _legacy_assign_aliases(
-    proxies: List[str], aliases: Dict[str, str]
+    proxies: List[str], aliases: Dict[str, str], explicit: Set[str] | None = None
 ) -> Dict[str, str]:
     """alias_key -> имя прокси из подписки (один узел на алиас максимум)."""
     keys = sorted(aliases.keys(), key=_alias_sort_key)
     used: Set[str] = set()
     assigned: Dict[str, str] = {}
+    # FR-LC-06: explicitly requested aliases may share their first matching node.
+    # With no explicit aliases this is exactly the 6b8a52d allocation order.
+    explicit = explicit or set()
     for alias in keys:
+        if alias in explicit:
+            match = next((p for p in proxies if re.search(aliases[alias], p)), None)
+            if match is not None:
+                assigned[alias] = match
+                used.add(match)
+    for alias in keys:
+        if alias in explicit:
+            continue
         pat = aliases[alias]
         rx = re.compile(pat)
         for p in proxies:
@@ -1723,8 +1736,8 @@ def main(*, rules_ready=False) -> int:
         rules_ready = True
     if not _uses_numbered_aliases():
         return _legacy_main(rules_ready=rules_ready)
-    codes = _load_iso_codes()
-    labels = _load_alias_labels(codes)
+    codes = _load_iso_codes(legacy=True)
+    labels = _load_alias_labels(codes, legacy=True)
     aliases = _build_alias_regexes(codes, labels)
     rules_url = None if rules_ready else _read_routing_rules_url()
     if rules_url:
@@ -1739,23 +1752,17 @@ def main(*, rules_ready=False) -> int:
     if not _uses_numbered_aliases():
         return _legacy_main(rules_ready=True)
     fallbacks, probes, metadata_claims = _cascade_metadata(codes)
-    explicit = metadata_claims | set(labels)
+    explicit = metadata_claims | {alias for alias in labels if _numeric_alias(alias)}
     for rule in rules:
         policy = _rule_policy(rule)
         if not policy or policy in BUILTIN_POLICIES:
             continue
         if policy.endswith("-failover") and policy.removesuffix("-failover") in fallbacks:
             explicit.add(policy.removesuffix("-failover"))
-        elif _physical_alias(policy, codes):
+        elif policy in aliases or _physical_alias(policy, codes):
             explicit.add(policy)
         # FR-LC-06 permits non-alias policies alongside numbered aliases.
-    tokens = set()
     for alias in sorted(explicit):
-        effective = _alias_tokens(alias, labels)
-        if tokens & effective:
-            print("Invalid alias assignment: conflicting alias labels", file=sys.stderr)
-            raise SystemExit(3)
-        tokens.update(effective)
         if alias not in aliases:
             aliases[alias] = rf"\b(?ai:{alias[:2].upper()})-?{alias[2:]}\b"
     url = _read_subscription_url()
@@ -1773,17 +1780,13 @@ def main(*, rules_ready=False) -> int:
     proxies.sort(key=lambda p: p["name"])
     _check_node_floor(len(proxies))
     proxy_names = [p["name"] for p in proxies]
-    if any(sum(bool(re.search(pattern, name)) for name in proxy_names) > 1
-           for pattern in aliases.values()):
-        assigned = _legacy_assign_aliases(proxy_names, aliases)
-    else:
-        assigned = _assign_aliases(proxy_names, aliases, explicit)
+    assigned = _legacy_assign_aliases(proxy_names, aliases, explicit)
     if any(_numeric_alias(alias) and alias not in assigned for alias in labels.keys() - metadata_claims):
         print("Invalid alias assignment: missing physical alias", file=sys.stderr)
         raise SystemExit(3)
     gen, groups = _build_generated(proxies, assigned, rules, aliases, fallbacks, probes)
 
-    base = _strip_orphan_listeners(BASE_CFG.read_text(encoding="utf-8"), groups, codes)
+    base = _legacy_strip_orphan_listeners(BASE_CFG.read_text(encoding="utf-8"), groups)
     base = base.rstrip() + "\n\n"
     _emit_aliases_yaml(aliases)
     _write_if_changed(OUT_CFG, base + gen)
