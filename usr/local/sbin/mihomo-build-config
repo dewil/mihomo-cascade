@@ -468,14 +468,15 @@ def _dump_clash_proxies(proxies: List[Dict[str, Any]]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _load_iso_codes() -> List[str]:
+def _load_iso_codes(*, legacy=False) -> List[str]:
     if not ISO_CODES.is_file():
         print("Нет /etc/mihomo/iso3166_alpha2.txt", file=sys.stderr)
         sys.exit(1)
     codes = []
     for ln in ISO_CODES.read_text(encoding="utf-8").splitlines():
         c = ln.strip()
-        if re.fullmatch(r"[A-Za-z]{2}", c):
+        if (len(c.lower()) == 2 and c.lower().isalpha() if legacy
+                else re.fullmatch(r"[A-Za-z]{2}", c)):
             codes.append(c.lower())
     return sorted(set(codes))
 
@@ -770,6 +771,7 @@ def _build_generated(
     aliases: Dict[str, str],
     fallbacks=None,
     probes=None,
+    *, legacy=False,
 ) -> str:
     """config.yaml = узлы статикой + группы по алиасам + правила.
 
@@ -785,7 +787,7 @@ def _build_generated(
     probes = probes or set()
     referenced: Set[str] = set()
     for r in rules:
-        pol = _rule_policy(r)
+        pol = _legacy_rule_policy(r) if legacy else _rule_policy(r)
         if pol and pol not in BUILTIN_POLICIES:
             referenced.add(pol)
 
@@ -829,9 +831,13 @@ def _build_generated(
         if pol not in BUILTIN_POLICIES and pol not in assigned and pol not in fallback_groups
     ]
     ordinary_orphans = [pol for pol in orphans if pol not in probes]
-    if any(_numeric_alias(pol) for pol in ordinary_orphans):
+    if not legacy and any(pol in aliases and _numeric_alias(pol)
+                          for pol in ordinary_orphans):
         print("Invalid alias assignment: missing physical alias", file=sys.stderr)
         raise SystemExit(3)
+    if not legacy:
+        # FR-LC-06: a non-alias policy must not prevent numbered groups building.
+        ordinary_orphans = [pol for pol in ordinary_orphans if pol in aliases]
     if ordinary_orphans:
         # Может не вернуться: при живом предыдущем конфиге выходит с кодом 3.
         _check_orphan_policies(ordinary_orphans)
@@ -1481,11 +1487,233 @@ def _main_v3() -> int:
         sub_tmp.unlink(missing_ok=True)
 
 
-def main() -> int:
+# The no-contract, non-numbered path preserves 6b8a52d semantics.
+_LEGACY_LISTENER_PROXY_RE = re.compile(r"^\s*-\s*\{[^}]*\bproxy:\s*([A-Za-z0-9_-]+)\s*\}\s*$")
+
+
+def _legacy_build_alias_regexes(codes: List[str]) -> Dict[str, str]:
+    """Ключи: nl, nl2, nl3. \\b, чтобы HU не матчил 'hub' и т.п."""
+    out: Dict[str, str] = {}
+    for c in codes:
+        U = c.upper()
+        out[f"{c}3"] = rf"(?i)\b{U}3\b"
+        out[f"{c}2"] = rf"(?i)\b{U}2\b"
+        out[c] = rf"(?i)\b{U}\b"
+    try:
+        labels = json.loads(ALIAS_LABELS.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return out
+    except (OSError, ValueError):
+        print("Invalid alias-labels.json", file=sys.stderr)
+        raise SystemExit(3) from None
+    if not isinstance(labels, dict) or any(
+        key not in out
+        or not isinstance(value, str)
+        or re.fullmatch(r"[A-Za-z]{2}[0-9]*", value, flags=re.ASCII) is None
+        for key, value in labels.items()
+    ):
+        print("Invalid alias-labels.json", file=sys.stderr)
+        raise SystemExit(3)
+    for key, value in labels.items():
+        out[key] = rf"(?i)\b{re.escape(value)}\b"
+    return out
+
+
+def _legacy_assign_aliases(
+    proxies: List[str], aliases: Dict[str, str]
+) -> Dict[str, str]:
+    """alias_key -> имя прокси из подписки (один узел на алиас максимум)."""
+    keys = sorted(aliases.keys(), key=_alias_sort_key)
+    used: Set[str] = set()
+    assigned: Dict[str, str] = {}
+    for alias in keys:
+        pat = aliases[alias]
+        rx = re.compile(pat)
+        for p in proxies:
+            if p in used:
+                continue
+            if rx.search(p):
+                assigned[alias] = p
+                used.add(p)
+                break
+    return assigned
+
+
+def _legacy_rule_policy(rule: str) -> str | None:
+    if rule.upper().startswith("MATCH"):
+        return None
+    parts = rule.split(",", 2)
+    if len(parts) < 3:
+        return None
+    return parts[2].strip().strip('"').strip("'")
+
+
+def _legacy_cascade_metadata(aliases: Dict[str, str], proxy_names: List[str]):
+    """Strict inline JSON metadata, delivered atomically with the rules."""
+    def validate(fallbacks, probes, *, required=False):
+        if not isinstance(fallbacks, dict) or (required and not fallbacks):
+            raise ValueError("expected nonempty fallback map")
+        if not isinstance(probes, list) or any(not isinstance(x, str) for x in probes) or len(set(probes)) != len(probes):
+            raise ValueError("expected unique probe aliases")
+        mentioned = set(probes)
+        for primary, reserves in fallbacks.items():
+            if not isinstance(reserves, list) or not reserves or any(not isinstance(x, str) for x in reserves):
+                raise ValueError("expected nonempty reserve list")
+            if len(set(reserves)) != len(reserves) or primary in reserves:
+                raise ValueError("duplicate or self reserve")
+            if primary + "-failover" in aliases:
+                raise ValueError("derived policy collision")
+            mentioned.update([primary, *reserves])
+        for alias in mentioned:
+            if alias not in aliases or alias in BUILTIN_POLICIES:
+                raise ValueError("unknown physical alias")
+            if sum(bool(re.search(aliases[alias], name)) for name in proxy_names) > 1:
+                raise ValueError("ambiguous physical alias")
+        for name in proxy_names:
+            if sum(bool(re.search(aliases[alias], name)) for alias in mentioned) > 1:
+                raise ValueError("proxy matches multiple physical aliases")
+
+    data = {}
+    try:
+        for line in ROUTING_RULES.read_text(encoding="utf-8").splitlines():
+            for key in ("cascade-fallbacks", "cascade-probes"):
+                if line.startswith(key + ":"):
+                    if key in data:
+                        raise ValueError("duplicate metadata field")
+                    data[key] = json.loads(line.split(":", 1)[1], object_pairs_hook=_unique_object)
+        fallbacks = data.get("cascade-fallbacks", {})
+        probes = data.get("cascade-probes", [])
+        # A local override must never conceal an invalid central chain.
+        validate(fallbacks, probes, required="cascade-fallbacks" in data)
+        # lexists also catches dangling symlinks; only an absent file is optional.
+        if os.path.lexists(LOCAL_FALLBACKS):
+            local = json.loads(LOCAL_FALLBACKS.read_text(encoding="utf-8"), object_pairs_hook=_unique_object)
+            validate(local, probes, required=True)
+            fallbacks = {**fallbacks, **local}
+            validate(fallbacks, probes)
+        return fallbacks, set(probes)
+    except (OSError, UnicodeError):
+        print("Cannot read cascade metadata", file=sys.stderr)
+        raise SystemExit(3)
+    except (ValueError, TypeError) as error:
+        print("Invalid cascade metadata: " + str(error), file=sys.stderr)
+        raise SystemExit(3)
+
+
+def _legacy_strip_orphan_listeners(base_text: str, groups: Set[str]) -> str:
+    """Выкинуть листенеры, чьей группы в этой сборке нет.
+
+    Листенеры живут в статическом config.base.yaml, а группы генерятся из
+    подписки. Выводим ноду - группа исчезает, листенер остается, mihomo молча
+    его не поднимает, и порт просто закрыт. Снаружи это выглядит как отказ
+    диагностики: проба каскада из cactus-adm получает timeout и алертит, хотя
+    ломать нечего. Поймано 2026-08-06 на выводе ноды it.
+    """
+    kept: List[str] = []
+    dropped: List[str] = []
+    for line in base_text.splitlines():
+        m = _LEGACY_LISTENER_PROXY_RE.match(line)
+        if m and m.group(1) not in groups and m.group(1) not in BUILTIN_POLICIES:
+            dropped.append(m.group(1))
+            continue
+        kept.append(line)
+    if dropped:
+        print(
+            "Листенеры без своей группы убраны из конфига: "
+            f"{', '.join(sorted(set(dropped)))}. "
+            "Если нода вернется в подписку - вернутся сами.",
+            file=sys.stderr,
+        )
+    return "\n".join(kept)
+
+
+def _legacy_main(*, rules_ready=False) -> int:
+    codes = _load_iso_codes(legacy=True)
+    aliases = _legacy_build_alias_regexes(codes)
+    rules_url = None if rules_ready else _read_routing_rules_url()
+    if rules_url:
+        if not _download_routing_rules(rules_url):
+            print(
+                "Прежние правила используются только при наличии настоящей настройки.",
+                file=sys.stderr,
+            )
+    rules = _load_routing_rules()
+    rules = _load_local_rules() + rules
+    if _uses_numbered_aliases():
+        return main(rules_ready=True)
+    url = _read_subscription_url()
+    raw = _download_subscription(url)
+    proxies = _decode_subscription_proxies(raw)
+    if not proxies:
+        print(
+            "Из подписки не извлечено ни одного vless-прокси. "
+            "Проверьте формат ответа sub_url (ожидается base64 или plaintext с vless://).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    # Агрегатор временами отдает те же узлы в другом порядке. Без сортировки
+    # конфиг менялся бы на ровном месте (а значит и лишний reload), плюс раздача
+    # алиасов ниже берет ПЕРВОЕ совпадение - то есть от порядка зависела бы еще
+    # и привязка алиаса к узлу.
+    proxies.sort(key=lambda p: p["name"])
+    _check_node_floor(len(proxies))
+    proxy_names = [p["name"] for p in proxies]
+    assigned = _legacy_assign_aliases(proxy_names, aliases)
+    fallbacks, probes = _legacy_cascade_metadata(aliases, proxy_names)
+    gen, groups = _build_generated(proxies, assigned, rules, aliases, fallbacks, probes, legacy=True)
+
+    base = _legacy_strip_orphan_listeners(BASE_CFG.read_text(encoding="utf-8"), groups)
+    base = base.rstrip() + "\n\n"
+    _emit_aliases_yaml(aliases)
+    _write_if_changed(OUT_CFG, base + gen)
+    _save_state(len(proxies))
+    return 0
+
+
+def _uses_numbered_aliases() -> bool:
+    """Select the r7 extension only for explicitly requested numeric aliases."""
+    def numbered(value):
+        return isinstance(value, str) and bool(
+            re.fullmatch(r"[a-z]{2}[1-9][0-9]{0,8}", value)
+        ) and _numeric_alias(value)
+
+    def metadata(value):
+        if isinstance(value, dict):
+            return any(numbered(key) or (isinstance(item, list)
+                       and any(numbered(alias) for alias in item))
+                       for key, item in value.items())
+        if isinstance(value, list):
+            return any(numbered(item) for item in value)
+        return False
+
+    try:
+        for path in (ALIAS_LABELS, LOCAL_FALLBACKS):
+            if path.is_file():
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if (any(numbered(key) for key in data) if path == ALIAS_LABELS
+                        and isinstance(data, dict) else metadata(data)):
+                    return True
+        for path in (ROUTING_RULES, LOCAL_RULES):
+            for rule in _parse_rules_file(path):
+                try:
+                    policy = _rule_policy(rule) or ""
+                except IndexError:
+                    continue  # A legacy rule need not be valid for the r7 parser.
+                if numbered(policy.removesuffix("-failover")):
+                    return True
+        for line in ROUTING_RULES.read_text(encoding="utf-8").splitlines():
+            if line.startswith(("cascade-fallbacks:", "cascade-probes:")):
+                if metadata(json.loads(line.split(":", 1)[1])):
+                    return True
+    except (OSError, ValueError, TypeError):
+        pass  # The selected builder reports malformed input in its original order.
+    return False
+
+
+def main(*, rules_ready=False) -> int:
     if os.path.lexists(BASE / "cascade-contract"):
         return _main_v3()
-    rules_ready = False
-    if _contract_header(ROUTING_RULES) is not None:
+    if not rules_ready and _contract_header(ROUTING_RULES) is not None:
         # Opt-out can replace cached v3 rules with the restored legacy URL.
         # Otherwise refuse before consulting any legacy-only alias files.
         rules_url = _read_routing_rules_url()
@@ -1493,6 +1721,8 @@ def main() -> int:
             _download_routing_rules(rules_url)
         _reject_unopted_contract(ROUTING_RULES)
         rules_ready = True
+    if not _uses_numbered_aliases():
+        return _legacy_main(rules_ready=rules_ready)
     codes = _load_iso_codes()
     labels = _load_alias_labels(codes)
     aliases = _build_alias_regexes(codes, labels)
@@ -1506,6 +1736,8 @@ def main() -> int:
     _reject_unopted_contract(ROUTING_RULES)
     rules = _load_routing_rules()
     rules = _load_local_rules() + rules
+    if not _uses_numbered_aliases():
+        return _legacy_main(rules_ready=True)
     fallbacks, probes, metadata_claims = _cascade_metadata(codes)
     explicit = metadata_claims | set(labels)
     for rule in rules:
@@ -1516,9 +1748,7 @@ def main() -> int:
             explicit.add(policy.removesuffix("-failover"))
         elif _physical_alias(policy, codes):
             explicit.add(policy)
-        else:
-            print("Invalid alias assignment: unknown physical alias", file=sys.stderr)
-            raise SystemExit(3)
+        # FR-LC-06 permits non-alias policies alongside numbered aliases.
     tokens = set()
     for alias in sorted(explicit):
         effective = _alias_tokens(alias, labels)
@@ -1543,7 +1773,11 @@ def main() -> int:
     proxies.sort(key=lambda p: p["name"])
     _check_node_floor(len(proxies))
     proxy_names = [p["name"] for p in proxies]
-    assigned = _assign_aliases(proxy_names, aliases, explicit)
+    if any(sum(bool(re.search(pattern, name)) for name in proxy_names) > 1
+           for pattern in aliases.values()):
+        assigned = _legacy_assign_aliases(proxy_names, aliases)
+    else:
+        assigned = _assign_aliases(proxy_names, aliases, explicit)
     if any(_numeric_alias(alias) and alias not in assigned for alias in labels.keys() - metadata_claims):
         print("Invalid alias assignment: missing physical alias", file=sys.stderr)
         raise SystemExit(3)
