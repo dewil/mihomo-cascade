@@ -269,15 +269,18 @@ def v3_cases(ref, prefix=''):
 
 
 # ------------------------------------------------------------ FR-LC-06
-def groups_case(name, sub, rules, expect_groups):
+def groups_case(name, sub, rules, expect_groups, extra=None, expect_text=()):
     """New builder alone: rc must be 0 and config.yaml must contain a proxy-group
     (line `  - name: <alias>`) for every alias in expect_groups."""
     try:
-        (rc, files), = scenario(None, sub, rules, None, None, None, [BUILDER])
+        (rc, files), = scenario(None, sub, rules, None, None, extra, [BUILDER])
         cfg = files.get('config.yaml', b'').decode('utf-8', 'replace')
         have = set(re.findall(r'^  - name: "?([^"\n]+?)"?\s*$', cfg, re.M))
         missing = [g for g in expect_groups if g not in have]
-        why = f'rc={rc}, want 0' if rc != 0 else (f'no proxy-group for {missing}' if missing else None)
+        lost = [t for t in expect_text if t not in cfg]
+        why = f'rc={rc}, want 0' if rc != 0 else (
+            f'no proxy-group for {missing}' if missing else (
+                f'config.yaml lost {lost}' if lost else None))
     except Exception as e:
         why = f'harness error: {e!r}'
     if why:
@@ -302,6 +305,58 @@ def numbered_cases(r7):
                 rules_text(['DOMAIN-SUFFIX,a.example,de5', 'DOMAIN-SUFFIX,b.example,de3',
                             'DOMAIN-SUFFIX,c.example,pl', 'MATCH,DIRECT']),
                 ['de5', 'de3', 'pl'])
+
+
+def orphan_with_previous_case(r7):
+    """06g: previous config/state built (by r7, which accepts de5) from a 3-node subscription;
+    then rules de5, de (no node: orphan), Telegram -> rc=3, config.yaml kept byte-for-byte
+    (the orphan protection of 6b8a52d)."""
+    name = 'FR-LC-06g orphan alias + previous config: rc=3, config kept'
+    try:
+        sub = sub_text(['DE5 node', 'PL node', 'EE node'])
+        d = tempfile.mkdtemp(prefix='lc-g-', dir=TMP)
+        base, sp = make_sandbox(d, sub, rules_text(['DOMAIN,example,de5', 'DOMAIN,example2,pl']))
+        seed_rc = run(r7, base)
+        before = snap(base)
+        (base / 'routing-rules.yaml').write_text(rules_text(
+            ['DOMAIN,example,de5', 'DOMAIN,example2,de', 'DOMAIN,example3,Telegram']))
+        rc = run(BUILDER, base)
+        after = snap(base)
+        if seed_rc != 0 or 'config.yaml' not in before or 'build-state.json' not in before:
+            why = f'harness: seeding failed (rc={seed_rc})'
+        elif rc != 3:
+            why = f'rc={rc}, want 3'
+        elif after.get('config.yaml') != before['config.yaml']:
+            why = 'previous config.yaml was changed'
+        elif after.get('build-state.json') != before['build-state.json']:
+            why = 'previous build-state.json was changed'
+        else:
+            why = None
+    except Exception as e:
+        why = f'harness error: {e!r}'
+    if why:
+        FAILS.append(name)
+    print(('FAIL ' if why else 'PASS ') + name + (f' - {why}' if why else ''), flush=True)
+
+
+def numbered_more_cases(r7):
+    groups_case('FR-LC-06e one node matches de5 and de6: rc=0, both groups',
+                sub_text(['DE5 DE6 node', 'DE6 backup', 'PL node']),
+                rules_text(['DOMAIN,example,de5', 'DOMAIN,example2,de6']), ['de5', 'de6'])
+    # 06f formulation (justified by a black-box run of 6b8a52d on the same input with
+    # `de` instead of `de5`): rc=0 and the custom listener stays with `proxy: Telegram`.
+    base_cfg = (ROOT / 'etc/mihomo/config.base.yaml').read_text().replace(
+        'listeners:\n', 'listeners:\n  - {name: custom, type: mixed, port: 1111, proxy: Telegram}\n', 1)
+    groups_case('FR-LC-06f non-alias policy as listener proxy kept: rc=0',
+                sub_text(['DE5 node', 'PL node', 'EE node']),
+                rules_text(['DOMAIN,example,de5', 'DOMAIN,example2,Telegram']), ['de5'],
+                extra={'config.base.yaml': base_cfg},
+                expect_text=['{name: custom, type: mixed, port: 1111, proxy: Telegram}'])
+    orphan_with_previous_case(r7)
+    groups_case('FR-LC-06h alias-labels.json {"de":"DE","pl":"DE"} accepted: rc=0',
+                sub_text(['DE node', 'DE5 node', 'EE node']),
+                rules_text(['DOMAIN,example,de5', 'DOMAIN,example2,Telegram']), ['de5'],
+                extra={'alias-labels.json': '{"de":"DE","pl":"DE"}\n'})
 
 
 # ------------------------------------------------------------ FR-LC-03 real
@@ -410,6 +465,7 @@ def main():
         legacy_cases(ref_legacy)
         v3_cases(ref_v3)
         numbered_cases(ref_v3)
+        numbered_more_cases(ref_v3)
         if args.real_rules_dir:
             real_cases(ref_legacy, ref_v3, args.real_rules_dir)
         helpers_case(ref_v3)
