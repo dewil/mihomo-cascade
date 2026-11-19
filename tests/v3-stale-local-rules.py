@@ -90,6 +90,12 @@ class StaleLocalRules(unittest.TestCase):
         self.assertIn('chatgpt.com,svc-us2', self.config())
         self.assertIn('"generation": 43', (self.base / 'build-state.json').read_text())
 
+    def test_malformed_local_rule_still_refused(self):
+        r = self.build(published(43, ['DOMAIN-SUFFIX,chatgpt.com,svc-us2', 'MATCH,DIRECT']),
+                       ['DOMAIN-SUFFIX,openai.com'])
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('unknown policy', r.stderr)
+
     def test_published_unknown_policy_still_refused(self):
         r = self.build(published(43, ['DOMAIN-SUFFIX,chatgpt.com,svc-gone', 'MATCH,DIRECT']),
                        [])
