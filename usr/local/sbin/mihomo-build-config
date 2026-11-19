@@ -1172,7 +1172,7 @@ def _validate_v3(path: pathlib.Path, *, local_rules=(), target=None, generation=
     # freeze the installation on an old generation: drop it and say so.
     kept_local = []
     for rule in local_rules:
-        if _rule_policy(rule) is None:
+        if not _rule_policy(rule):
             invalid("unknown policy")  # malformed rule, not a stale pin
         if _rule_policy(rule) in policies:
             kept_local.append(rule)
