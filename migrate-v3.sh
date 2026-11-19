@@ -40,7 +40,10 @@ grep -q '"contract": 3' "$E/build-state.json" 2>/dev/null || restore "сборк
 code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 -x "socks5h://$PROXY" https://github.com)
 [ "$code" = 200 ] || restore "github через $PROXY ответил $code"
 
-if ( cd "$SRC" && bash install.sh --step updater ) && mihomo-update enable --accept-current; then
+# Updater мог запомнить прежний сборщик как baseline: новый явно принимаем.
+if ( cd "$SRC" && bash install.sh --step updater ) \
+   && { mihomo-update rebaseline --accept-current 2>/dev/null || true; } \
+   && mihomo-update enable --accept-current; then
   echo "автообновление сборщика включено"
 else
   echo "автообновление не включилось; v3 работает, включить: docs/autoupdate.md"
