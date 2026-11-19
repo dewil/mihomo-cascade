@@ -1,0 +1,59 @@
+# mihomo для XKeen на Keenetic: через VPN идет только список ниже, остальное напрямую.
+# Вставьте свою ссылку подписки в url, кавычки оставьте.
+# Группа VPN сама переключается на живую ноду, имена нод не важны.
+find-process-mode: "off"
+mode: rule
+log-level: info
+
+listeners:
+  - name: tproxy
+    type: tproxy
+    port: 1181
+    udp: true
+  - name: redir
+    type: redir
+    port: 1182
+
+sniffer:
+  enable: true
+  parse-pure-ip: true
+  sniff:
+    HTTP:
+      ports: [80, 8080]
+    TLS:
+      ports: [443]
+    QUIC:
+      ports: [443]
+
+proxy-providers:
+  cactus:
+    type: http
+    url: "СЮДА_URL_ПОДПИСКИ"
+    path: ./providers/cactus.yaml
+    interval: 3600
+    health-check:
+      enable: true
+      url: https://www.gstatic.com/generate_204
+      interval: 300
+      timeout: 5000
+      lazy: false
+
+proxy-groups:
+  - name: VPN
+    type: fallback
+    use: [cactus]
+    url: https://www.gstatic.com/generate_204
+    interval: 300
+    timeout: 5000
+    lazy: false
+
+rules:
+  - DOMAIN-SUFFIX,youtube.com,VPN
+  - DOMAIN-SUFFIX,youtu.be,VPN
+  - DOMAIN-SUFFIX,googlevideo.com,VPN
+  - DOMAIN-SUFFIX,ytimg.com,VPN
+  - DOMAIN-SUFFIX,ggpht.com,VPN
+  - DOMAIN-SUFFIX,youtube-nocookie.com,VPN
+  - DOMAIN-SUFFIX,youtubei.googleapis.com,VPN
+  - DOMAIN-SUFFIX,youtube.googleapis.com,VPN
+  - MATCH,DIRECT
