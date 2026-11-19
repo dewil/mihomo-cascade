@@ -46,6 +46,19 @@ wget -qO- https://raw.githubusercontent.com/dewil/mihomo-cascade/main/install.sh
 
 Режим можно форсировать переменной `MIHOMO_INSTALL_MODE=fresh|update`.
 
+### Переход на каскад v3
+
+Правила v3 не зависят от имен нод, `alias-labels.json` больше не нужен. Переход однократный, из полного дерева репозитория:
+
+```bash
+git clone https://github.com/dewil/mihomo-cascade && cd mihomo-cascade
+sudo bash migrate-v3.sh
+```
+
+Скрипт сохраняет бэкап в `/root/mihomo-v3-bak-*`, ставит сборщик v3, пишет `/etc/mihomo/cascade-contract` и переводит `routing-rules.url` на `rules-v3.yaml`. Подписку, `config.base.yaml`, `local-rules.yaml` и ядро не меняет. После перезапуска проверяет сборку и HTTP через прокси (`PROXY=127.0.0.1:7890` по умолчанию); при ошибке возвращает прежние файлы. В конце включает автообновление сборщика.
+
+Роутер Keenetic с XKeen - отдельное готовое решение в [xkeen/](xkeen/README.md).
+
 ### Автообновление сборщика
 
 На действительно новой стандартной установке после успешного запуска включается
